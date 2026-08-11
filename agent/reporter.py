@@ -72,12 +72,7 @@ Be precise, technical, and actionable. Use Markdown headers, code blocks, and ta
     client = _get_client()
     with client.messages.stream(
         model="claude-opus-4-8",
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
-        final = stream.get_final_message()
-
-    return "".join(
-        block.text for block in final.content if block.type == "text"
-    )
+        return stream.get_final_text()
