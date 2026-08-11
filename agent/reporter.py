@@ -70,14 +70,14 @@ Be precise, technical, and actionable. Use Markdown headers, code blocks, and ta
 
     logger.info(f"Generating remediation report (iteration {iteration})...")
     client = _get_client()
-    full_text = ""
     with client.messages.stream(
         model="claude-opus-4-8",
         max_tokens=4096,
         thinking={"type": "adaptive"},
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
-        for chunk in stream.text_stream:
-            full_text += chunk
+        final = stream.get_final_message()
 
-    return full_text
+    return "".join(
+        block.text for block in final.content if block.type == "text"
+    )
