@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+*.env
+
+# Runtime output
+output/
+scan-results/
+
+# Python
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Editor
+.DS_Store
+.idea/
+*.swp
