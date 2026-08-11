@@ -1,0 +1,25 @@
+# Shared storage for scan artifacts, reports, and Trivy DB cache.
+# Mount in Job/CronJob pods so data persists and Trivy DB is reused.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vuln-agent-output
+  namespace: security
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vuln-agent-trivy-cache
+  namespace: security
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi   # Trivy DB is ~600 MB compressed

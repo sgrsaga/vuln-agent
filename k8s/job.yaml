@@ -1,0 +1,125 @@
+# One-shot remediation Job.
+# Trigger manually:
+#   kubectl -n security create job vuln-remediate-dex \
+#     --from=cronjob/vuln-agent-scan   # if using the CronJob template
+#
+# Or apply this file directly (edit TARGET_IMAGE first):
+#   kubectl apply -f k8s/job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vuln-remediate-dex          # change per image being scanned
+  namespace: security
+  labels:
+    app: vuln-agent
+spec:
+  # Clean up finished pods automatically after 24 h
+  ttlSecondsAfterFinished: 86400
+  # Retry once on transient failures (build timeout, network blip)
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: vuln-agent
+    spec:
+      restartPolicy: Never
+
+      # Pull the vuln-agent image from GHCR
+      imagePullSecrets:
+        - name: ghcr-credentials
+
+      # ── Init container: pre-warm Trivy DB from cache ──────────────────────
+      # Omit this block if you prefer Trivy to always download fresh.
+      initContainers:
+        - name: trivy-db-update
+          image: aquasec/trivy:latest
+          args: ["image", "--download-db-only", "--cache-dir", "/trivy-cache"]
+          volumeMounts:
+            - name: trivy-cache
+              mountPath: /trivy-cache
+
+      containers:
+        - name: vuln-agent
+          image: ghcr.io/sgrsaga/vuln-agent:latest   # ← your built image
+          imagePullPolicy: Always
+
+          # ── Target image ────────────────────────────────────────────────────
+          args: ["ghcr.io/dexidp/dex:v2.45.1"]       # ← override per job
+
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vuln-agent-secrets
+                  key: anthropic-api-key
+
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vuln-agent-secrets
+                  key: github-token
+
+            - name: GITHUB_REPO
+              value: "sgrsaga/vuln-agent"
+
+            - name: GHCR_NAMESPACE
+              value: "ghcr.io/sgrsaga"
+
+            - name: MAX_ITERATIONS
+              value: "5"
+
+            - name: OUTPUT_DIR
+              value: "/app/output"
+
+            - name: TRIVY_CACHE_DIR
+              value: "/trivy-cache"
+
+          volumeMounts:
+            # Docker socket — needed for `docker build` and `docker push`.
+            # Security note: this grants root-equivalent host access.
+            # For production, replace with a Kaniko sidecar (see kaniko-job.yaml).
+            - name: docker-socket
+              mountPath: /var/run/docker.sock
+
+            # Docker auth config so `docker push` can reach GHCR
+            - name: docker-config
+              mountPath: /home/agent/.docker
+              readOnly: true
+
+            # Output artifacts (scan JSON, reports, Dockerfiles)
+            - name: output
+              mountPath: /app/output
+
+            # Trivy vulnerability DB cache (avoids re-downloading on each run)
+            - name: trivy-cache
+              mountPath: /trivy-cache
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+
+      volumes:
+        - name: docker-socket
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+
+        # Mount the GHCR dockerconfigjson secret as ~/.docker/config.json
+        - name: docker-config
+          secret:
+            secretName: ghcr-credentials
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+
+        - name: output
+          persistentVolumeClaim:
+            claimName: vuln-agent-output
+
+        - name: trivy-cache
+          persistentVolumeClaim:
+            claimName: vuln-agent-trivy-cache
