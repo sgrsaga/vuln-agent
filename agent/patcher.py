@@ -111,7 +111,9 @@ Generate a Dockerfile that fixes as many **OS / package** vulnerabilities as pos
         messages=[{"role": "user", "content": prompt}],
     )
 
-    raw = response.content[0].text.strip()
+    raw = "".join(
+        block.text for block in response.content if block.type == "text"
+    ).strip()
 
     if raw == CANNOT_PATCH or raw.startswith(CANNOT_PATCH):
         logger.info("Claude: no further patches possible")

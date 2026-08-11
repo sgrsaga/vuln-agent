@@ -19,7 +19,7 @@ def scan_image(image_ref: str) -> dict:
         ],
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=600,
     )
     if result.returncode != 0 and not result.stdout.strip():
         raise RuntimeError(f"Trivy scan failed:\n{result.stderr}")
