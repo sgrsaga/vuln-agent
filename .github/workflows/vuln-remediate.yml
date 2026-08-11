@@ -1,0 +1,112 @@
+name: Vulnerability Remediation Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Docker image to scan and remediate"
+        required: true
+        default: "ghcr.io/dexidp/dex:v2.45.1"
+      max_iterations:
+        description: "Max remediation loops (safety cap)"
+        required: false
+        default: "5"
+      push_to_ghcr:
+        description: "Push patched images to GHCR?"
+        type: boolean
+        default: true
+
+  # Also trigger on a schedule or push if you want continuous scanning
+  # schedule:
+  #   - cron: "0 4 * * 1"   # every Monday 04:00 UTC
+
+permissions:
+  contents: write    # create releases + upload assets
+  packages: write    # push images to ghcr.io
+  actions: read
+
+jobs:
+  remediate:
+    name: Remediate ${{ inputs.image }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Setup ──────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      # ── Registry auth ──────────────────────────────────────────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Run the agent ──────────────────────────────────────────────────────
+      - name: Run vulnerability remediation agent
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:       ${{ github.repository }}
+          GHCR_NAMESPACE:    ${{ inputs.push_to_ghcr && format('ghcr.io/{0}', github.repository_owner) || '' }}
+          MAX_ITERATIONS:    ${{ inputs.max_iterations }}
+          OUTPUT_DIR:        output
+        run: |
+          python main.py "${{ inputs.image }}" \
+            --max-iterations "${{ inputs.max_iterations }}" \
+            --output-dir output
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      # ── Upload all scan + report artifacts ─────────────────────────────────
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vuln-remediation-results
+          path: output/
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ── (Optional) Create / update a GitHub Release with all artifacts ─────
+      - name: Create GitHub Release with artifacts
+        if: always() && hashFiles('output/*') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="vuln-remediation-$(date -u +%Y%m%d-%H%M%S)"
+          IMAGE_SLUG=$(echo "${{ inputs.image }}" | tr '/:.' '-')
+          gh release create "$TAG" output/* \
+            --repo "${{ github.repository }}" \
+            --title "Vuln Remediation — ${IMAGE_SLUG}" \
+            --notes "$(cat <<'EOF'
+          ## Automated Vulnerability Remediation
+
+          **Source image:** \`${{ inputs.image }}\`
+          **Triggered by:** @${{ github.actor }}
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### Attached artifacts
+          - `scan-iter-N.json` — Trivy JSON output for each iteration
+          - `report-iter-N.md` — Claude Opus 4.8 remediation report for each iteration
+          - `dockerfile-iter-N` — Generated patch Dockerfile for each iteration
+
+          See the [Actions run summary](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for the full step-by-step log.
+          EOF
+          )"
