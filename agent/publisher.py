@@ -3,27 +3,33 @@ Publishes scan results, reports, and events to GitHub Artifacts.
 
 Inside GitHub Actions:
   - Scan JSON and report Markdown are written to OUTPUT_DIR (uploaded as an
-    artifact by the workflow YAML with actions/upload-artifact).
+    artifact by the workflow YAML via actions/upload-artifact).
   - Progress is appended to $GITHUB_STEP_SUMMARY so it appears in the Actions UI.
 
-Outside GitHub Actions (local run):
+Outside GitHub Actions / in k8s:
   - Same files are written to OUTPUT_DIR.
   - If GITHUB_TOKEN + GITHUB_REPO are set, a GitHub Release is created at the
-    end of the run and all output files are attached as release assets.
+    end of the run and all output files are attached as release assets via the
+    GitHub REST API (no gh CLI required — works inside Docker/k8s).
   - Progress is printed to stdout.
 """
 
 import json
 import os
-import subprocess
 import logging
+import mimetypes
 from pathlib import Path
 from datetime import datetime, timezone
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "output"))
 _STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
+
+_GH_API = "https://api.github.com"
+_GH_UPLOAD = "https://uploads.github.com"
 
 
 def _now() -> str:
@@ -31,7 +37,7 @@ def _now() -> str:
 
 
 def _md(text: str) -> None:
-    """Append text to the GitHub Actions step summary (no-op when not in Actions)."""
+    """Append Markdown to the GitHub Actions step summary (no-op outside Actions)."""
     if _STEP_SUMMARY:
         with open(_STEP_SUMMARY, "a") as fh:
             fh.write(text + "\n")
@@ -39,19 +45,19 @@ def _md(text: str) -> None:
 
 def _log(event_type: str, message: str, data: dict | None = None) -> None:
     icons = {
-        "pipeline_start": "🚀",
-        "scan_start":     "🔍",
-        "scan_complete":  "🔍",
-        "report_start":   "📋",
-        "report_complete":"📋",
-        "patch_start":    "🔧",
-        "patch_generated":"🔧",
-        "build_start":    "🏗️",
-        "build_complete": "🏗️",
-        "improvement":    "✅",
-        "no_improvement": "⚠️",
+        "pipeline_start":    "🚀",
+        "scan_start":        "🔍",
+        "scan_complete":     "🔍",
+        "report_start":      "📋",
+        "report_complete":   "📋",
+        "patch_start":       "🔧",
+        "patch_generated":   "🔧",
+        "build_start":       "🏗️",
+        "build_complete":    "🏗️",
+        "improvement":       "✅",
+        "no_improvement":    "⚠️",
         "pipeline_complete": "🏁",
-        "error":          "❌",
+        "error":             "❌",
     }
     icon = icons.get(event_type, "ℹ️")
     print(f"{icon}  [{event_type}] {message}", flush=True)
@@ -59,7 +65,17 @@ def _log(event_type: str, message: str, data: dict | None = None) -> None:
         logger.debug("event data: %s", json.dumps(data))
 
 
-# ── public API ──────────────────────────────────────────────────────────────
+def _normalize_repo(repo: str) -> str:
+    """Accept 'owner/repo', 'https://github.com/owner/repo', or '.git' URLs."""
+    repo = repo.rstrip("/")
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if repo.startswith("https://github.com/"):
+        repo = repo[len("https://github.com/"):]
+    return repo
+
+
+# ── public API ───────────────────────────────────────────────────────────────
 
 def publish_scan(
     image_ref: str,
@@ -84,7 +100,6 @@ def publish_scan(
     path.write_text(json.dumps(data, indent=2))
     logger.info(f"Scan saved → {path}")
 
-    # Step summary table
     _md(f"\n### 🔍 Scan — Iteration {iteration} (`{scan_target}`)\n")
     _md(f"| Severity | Count |\n|----------|-------|\n| CRITICAL | {crit} |\n| HIGH | {high} |\n| Total | {len(vulnerabilities)} |\n")
     if vulnerabilities:
@@ -98,9 +113,11 @@ def publish_scan(
 def publish_report(image_ref: str, iteration: int, content: str) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / f"report-iter-{iteration}.md"
-    path.write_text(f"# Remediation Report — Iteration {iteration}\n\n> Image: `{image_ref}`\n\n{content}")
+    path.write_text(
+        f"# Remediation Report — Iteration {iteration}\n\n"
+        f"> Image: `{image_ref}`\n\n{content}"
+    )
     logger.info(f"Report saved → {path}")
-
     _md(f"\n<details><summary>📋 Recovery Report — Iteration {iteration}</summary>\n\n{content}\n\n</details>\n")
 
 
@@ -111,42 +128,80 @@ def publish_event(event_type: str, message: str, data: dict | None = None) -> No
 
 def create_github_release(tag: str | None = None) -> None:
     """
-    Create a GitHub Release and attach all output files as assets.
-    Requires GITHUB_TOKEN and GITHUB_REPO env vars, and the `gh` CLI.
-    Only called at the end of a run when not already inside GitHub Actions.
+    Create a GitHub Release via REST API and upload all output files as assets.
+
+    Works anywhere (local, Docker, k8s) — no gh CLI required.
+    No-op when:
+      - Running inside GitHub Actions (workflow uses actions/upload-artifact instead)
+      - GITHUB_TOKEN or GITHUB_REPO env vars are missing
     """
     if os.environ.get("GITHUB_ACTIONS"):
-        return  # Actions workflow handles artifact upload via actions/upload-artifact
+        return
 
-    token = os.environ.get("GITHUB_TOKEN")
-    repo = os.environ.get("GITHUB_REPO")
-    if not (token and repo):
-        logger.info("GITHUB_TOKEN/GITHUB_REPO not set — skipping release creation")
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo = _normalize_repo(os.environ.get("GITHUB_REPO", ""))
+    if not token or not repo:
+        logger.info("GITHUB_TOKEN/GITHUB_REPO not set — skipping GitHub Release")
+        return
+
+    files = [f for f in OUTPUT_DIR.glob("*") if f.is_file()]
+    if not files:
+        logger.info("No output files to attach — skipping GitHub Release")
         return
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     release_tag = tag or f"vuln-remediation-{ts}"
-    files = list(OUTPUT_DIR.glob("*"))
-    if not files:
-        return
 
-    file_args = [str(f) for f in files]
-    env = {**os.environ, "GH_TOKEN": token}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
-    logger.info(f"Creating GitHub Release {release_tag} in {repo}...")
-    result = subprocess.run(
-        [
-            "gh", "release", "create", release_tag,
-            "--repo", repo,
-            "--title", f"Vulnerability Remediation — {ts}",
-            "--notes", "Automated remediation results — see attached scan JSON and Markdown reports.",
-            *file_args,
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        logger.info(f"Release created: {result.stdout.strip()}")
-    else:
-        logger.warning(f"gh release create failed: {result.stderr.strip()}")
+    logger.info(f"Creating GitHub Release {release_tag} in {repo} ...")
+    with httpx.Client(timeout=30.0) as client:
+        # 1. Create the release
+        resp = client.post(
+            f"{_GH_API}/repos/{repo}/releases",
+            headers=headers,
+            json={
+                "tag_name": release_tag,
+                "name": f"Vulnerability Remediation — {ts}",
+                "body": (
+                    "## Automated vulnerability remediation results\n\n"
+                    "### Attached artifacts\n"
+                    "- `scan-iter-N.json` — Trivy JSON output per iteration\n"
+                    "- `report-iter-N.md` — Claude Opus 4.8 remediation report per iteration\n"
+                    "- `dockerfile-iter-N` — Generated patch Dockerfile per iteration\n"
+                ),
+                "draft": False,
+                "prerelease": True,
+            },
+        )
+        if resp.status_code not in (200, 201):
+            logger.warning(f"Failed to create release: {resp.status_code} {resp.text[:300]}")
+            return
+
+        release = resp.json()
+        release_url = release.get("html_url", "")
+        upload_url = release["upload_url"].split("{")[0]  # strip "{?name,label}"
+        logger.info(f"Release created: {release_url}")
+
+        # 2. Upload each file as a release asset
+        upload_headers = {**headers, "Content-Type": "application/octet-stream"}
+        for f in sorted(files):
+            ct, _ = mimetypes.guess_type(f.name)
+            if ct:
+                upload_headers["Content-Type"] = ct
+
+            data = f.read_bytes()
+            up = client.post(
+                f"{upload_url}?name={f.name}",
+                headers=upload_headers,
+                content=data,
+                timeout=60.0,
+            )
+            if up.status_code in (200, 201):
+                logger.info(f"  Uploaded asset: {f.name} ({len(data)} bytes)")
+            else:
+                logger.warning(f"  Asset upload failed for {f.name}: {up.status_code}")

@@ -1,0 +1,108 @@
+# Periodic scanning CronJob — scans a fixed image on a schedule.
+# Each run is a fresh Job; results are uploaded to GitHub Releases.
+#
+# To trigger immediately without waiting for the schedule:
+#   kubectl -n security create job vuln-scan-manual \
+#     --from=cronjob/vuln-agent-scan
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vuln-agent-scan
+  namespace: security
+  labels:
+    app: vuln-agent
+spec:
+  # Every Monday at 04:00 UTC
+  schedule: "0 4 * * 1"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid          # don't start a new run if one is still going
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: vuln-agent
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-credentials
+
+          initContainers:
+            - name: trivy-db-update
+              image: aquasec/trivy:latest
+              args: ["image", "--download-db-only", "--cache-dir", "/trivy-cache"]
+              volumeMounts:
+                - name: trivy-cache
+                  mountPath: /trivy-cache
+
+          containers:
+            - name: vuln-agent
+              image: ghcr.io/sgrsaga/vuln-agent:latest
+              imagePullPolicy: Always
+
+              # ← Add all images to scan here; one arg = one image
+              args: ["ghcr.io/dexidp/dex:v2.45.1"]
+
+              env:
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vuln-agent-secrets
+                      key: anthropic-api-key
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: vuln-agent-secrets
+                      key: github-token
+                - name: GITHUB_REPO
+                  value: "sgrsaga/vuln-agent"
+                - name: GHCR_NAMESPACE
+                  value: "ghcr.io/sgrsaga"
+                - name: MAX_ITERATIONS
+                  value: "5"
+                - name: OUTPUT_DIR
+                  value: "/app/output"
+                - name: TRIVY_CACHE_DIR
+                  value: "/trivy-cache"
+
+              volumeMounts:
+                - name: docker-socket
+                  mountPath: /var/run/docker.sock
+                - name: docker-config
+                  mountPath: /home/agent/.docker
+                  readOnly: true
+                - name: output
+                  mountPath: /app/output
+                - name: trivy-cache
+                  mountPath: /trivy-cache
+
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "512Mi"
+                limits:
+                  cpu: "2"
+                  memory: "2Gi"
+
+          volumes:
+            - name: docker-socket
+              hostPath:
+                path: /var/run/docker.sock
+                type: Socket
+            - name: docker-config
+              secret:
+                secretName: ghcr-credentials
+                items:
+                  - key: .dockerconfigjson
+                    path: config.json
+            - name: output
+              persistentVolumeClaim:
+                claimName: vuln-agent-output
+            - name: trivy-cache
+              persistentVolumeClaim:
+                claimName: vuln-agent-trivy-cache
