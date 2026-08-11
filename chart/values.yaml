@@ -1,0 +1,112 @@
+# ── Agent container image ──────────────────────────────────────────────────
+image:
+  repository: ghcr.io/sgrsaga/vuln-agent
+  tag: latest
+  pullPolicy: Always
+
+# ── Anthropic API credentials ─────────────────────────────────────────────
+anthropic:
+  # Set the key inline (a Secret is created from this value)
+  apiKey: ""
+  # -- OR -- reference an existing Secret (apiKey above is ignored if set)
+  existingSecret: ""
+  existingSecretKey: "anthropic-api-key"
+
+# ── GitHub credentials ────────────────────────────────────────────────────
+# Used for: pushing images to GHCR + creating GitHub Releases with artifacts.
+# Required scopes: repo + write:packages
+github:
+  token: ""
+  existingSecret: ""
+  existingSecretKey: "github-token"
+  # Repository for GitHub Release artifacts (owner/repo format)
+  repo: ""
+
+# ── Private registry for patched images ───────────────────────────────────
+registry:
+  # Namespace prefix for pushed images, e.g. "ghcr.io/myorg"
+  # Leave empty to build locally without pushing.
+  namespace: ""
+  # Credentials for docker push (creates a docker-registry Secret)
+  server: "ghcr.io"
+  username: ""
+  # Password / PAT — typically same as github.token for GHCR
+  password: ""
+  # -- OR -- reference an existing docker-registry Secret
+  existingSecret: ""
+
+# ── Image discovery ────────────────────────────────────────────────────────
+discovery:
+  # Namespaces to exclude from image discovery.
+  # The agent's own release namespace is automatically excluded.
+  excludedNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+
+  # Set to true to also scan images in init containers
+  includeInitContainers: false
+
+# ── Scan configuration ─────────────────────────────────────────────────────
+scan:
+  # Maximum remediation loops per image before stopping
+  maxIterations: 5
+
+# ── CronJob schedule ───────────────────────────────────────────────────────
+# Standard cron syntax. Default: every Monday at 04:00 UTC.
+schedule: "0 4 * * 1"
+timeZone: "UTC"
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+# Prevent overlapping runs (a slow scan must finish before the next fires)
+concurrencyPolicy: Forbid
+
+# ── Persistent storage ─────────────────────────────────────────────────────
+persistence:
+  output:
+    # Stores scan JSON, reports, and patch Dockerfiles
+    size: 5Gi
+    storageClass: ""      # use cluster default storage class
+    accessMode: ReadWriteOnce
+  trivyCache:
+    # Trivy vulnerability DB cache — avoids re-downloading on every run
+    size: 2Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+# ── Resource limits ────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+# ── Service account ────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  # Name — auto-generated from release name if empty
+  name: ""
+  annotations: {}
+
+# ── RBAC ──────────────────────────────────────────────────────────────────
+rbac:
+  # Creates a ClusterRole + ClusterRoleBinding for pod/namespace listing
+  create: true
+
+# ── Docker socket ─────────────────────────────────────────────────────────
+# Required for docker build + docker push inside the pod.
+# For rootless builds consider replacing with a Kaniko sidecar.
+dockerSocket:
+  hostPath: /var/run/docker.sock
+
+# ── Pod-level settings ─────────────────────────────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra environment variables injected into the agent container
+extraEnv: []
+# - name: HTTP_PROXY
+#   value: "http://proxy.example.com:3128"

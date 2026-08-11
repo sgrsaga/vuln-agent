@@ -1,0 +1,21 @@
+apiVersion: v2
+name: vuln-agent
+description: >
+  Agentic Docker image vulnerability remediator.
+  Scans all images running in a Kubernetes cluster with Trivy, generates
+  detailed security reports with Claude AI, applies iterative patches,
+  and pushes improved images to your private container registry.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - security
+  - vulnerability
+  - trivy
+  - claude
+  - remediation
+home: https://github.com/sgrsaga/vuln-agent
+sources:
+  - https://github.com/sgrsaga/vuln-agent
+maintainers:
+  - name: sgrsaga

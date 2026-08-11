@@ -2,42 +2,54 @@
 Publishes scan results, reports, and events to GitHub Artifacts.
 
 Inside GitHub Actions:
-  - Scan JSON and report Markdown are written to OUTPUT_DIR (uploaded as an
-    artifact by the workflow YAML via actions/upload-artifact).
-  - Progress is appended to $GITHUB_STEP_SUMMARY so it appears in the Actions UI.
+  - Files are written to OUTPUT_DIR; the workflow uploads them with
+    actions/upload-artifact.
+  - Progress is appended to $GITHUB_STEP_SUMMARY.
 
 Outside GitHub Actions / in k8s:
-  - Same files are written to OUTPUT_DIR.
-  - If GITHUB_TOKEN + GITHUB_REPO are set, a GitHub Release is created at the
-    end of the run and all output files are attached as release assets via the
-    GitHub REST API (no gh CLI required — works inside Docker/k8s).
+  - Files are written to OUTPUT_DIR (per-image subdirectory in discovery mode).
+  - A GitHub Release is created via the REST API at the end of the run;
+    all output files are attached as release assets (no gh CLI required).
   - Progress is printed to stdout.
 """
 
 import json
-import os
 import logging
 import mimetypes
-from pathlib import Path
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "output"))
+# ── Mutable output directory (call set_output_dir() before each image run) ──
+_output_dir: Path = Path(os.environ.get("OUTPUT_DIR", "output"))
+
 _STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
-
 _GH_API = "https://api.github.com"
-_GH_UPLOAD = "https://uploads.github.com"
 
+
+# ── Output dir management ────────────────────────────────────────────────────
+
+def set_output_dir(path: str | Path) -> None:
+    global _output_dir
+    _output_dir = Path(path)
+    _output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def get_output_dir() -> Path:
+    return _output_dir
+
+
+# ── Internal helpers ─────────────────────────────────────────────────────────
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def _md(text: str) -> None:
-    """Append Markdown to the GitHub Actions step summary (no-op outside Actions)."""
     if _STEP_SUMMARY:
         with open(_STEP_SUMMARY, "a") as fh:
             fh.write(text + "\n")
@@ -58,6 +70,8 @@ def _log(event_type: str, message: str, data: dict | None = None) -> None:
         "no_improvement":    "⚠️",
         "pipeline_complete": "🏁",
         "error":             "❌",
+        "discover_start":    "🔎",
+        "discover_complete": "🔎",
     }
     icon = icons.get(event_type, "ℹ️")
     print(f"{icon}  [{event_type}] {message}", flush=True)
@@ -66,7 +80,6 @@ def _log(event_type: str, message: str, data: dict | None = None) -> None:
 
 
 def _normalize_repo(repo: str) -> str:
-    """Accept 'owner/repo', 'https://github.com/owner/repo', or '.git' URLs."""
     repo = repo.rstrip("/")
     if repo.endswith(".git"):
         repo = repo[:-4]
@@ -75,7 +88,7 @@ def _normalize_repo(repo: str) -> str:
     return repo
 
 
-# ── public API ───────────────────────────────────────────────────────────────
+# ── Public API ───────────────────────────────────────────────────────────────
 
 def publish_scan(
     image_ref: str,
@@ -83,7 +96,8 @@ def publish_scan(
     scan_target: str,
     vulnerabilities: list[dict],
 ) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = get_output_dir()
+    out.mkdir(parents=True, exist_ok=True)
     crit = sum(1 for v in vulnerabilities if v["severity"] == "CRITICAL")
     high = sum(1 for v in vulnerabilities if v["severity"] == "HIGH")
 
@@ -96,12 +110,13 @@ def publish_scan(
         "high_count": high,
         "timestamp": _now(),
     }
-    path = OUTPUT_DIR / f"scan-iter-{iteration}.json"
+    path = out / f"scan-iter-{iteration}.json"
     path.write_text(json.dumps(data, indent=2))
     logger.info(f"Scan saved → {path}")
 
     _md(f"\n### 🔍 Scan — Iteration {iteration} (`{scan_target}`)\n")
-    _md(f"| Severity | Count |\n|----------|-------|\n| CRITICAL | {crit} |\n| HIGH | {high} |\n| Total | {len(vulnerabilities)} |\n")
+    _md(f"| Severity | Count |\n|----------|-------|\n"
+        f"| CRITICAL | {crit} |\n| HIGH | {high} |\n| Total | {len(vulnerabilities)} |\n")
     if vulnerabilities:
         _md("| Severity | CVE ID | Package | Installed | Fix Available |")
         _md("|----------|--------|---------|-----------|---------------|")
@@ -111,8 +126,9 @@ def publish_scan(
 
 
 def publish_report(image_ref: str, iteration: int, content: str) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUTPUT_DIR / f"report-iter-{iteration}.md"
+    out = get_output_dir()
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"report-iter-{iteration}.md"
     path.write_text(
         f"# Remediation Report — Iteration {iteration}\n\n"
         f"> Image: `{image_ref}`\n\n{content}"
@@ -126,14 +142,16 @@ def publish_event(event_type: str, message: str, data: dict | None = None) -> No
     _md(f"\n> {message}\n")
 
 
-def create_github_release(tag: str | None = None) -> None:
+def create_github_release(base_dir: Path | None = None, tag: str | None = None) -> None:
     """
     Create a GitHub Release via REST API and upload all output files as assets.
 
+    In discovery mode pass base_dir as the parent of all per-image subdirs so
+    that every image's artifacts are included. In single-image mode it defaults
+    to get_output_dir().
+
     Works anywhere (local, Docker, k8s) — no gh CLI required.
-    No-op when:
-      - Running inside GitHub Actions (workflow uses actions/upload-artifact instead)
-      - GITHUB_TOKEN or GITHUB_REPO env vars are missing
+    No-op when GITHUB_ACTIONS is set (workflow uses actions/upload-artifact).
     """
     if os.environ.get("GITHUB_ACTIONS"):
         return
@@ -144,9 +162,10 @@ def create_github_release(tag: str | None = None) -> None:
         logger.info("GITHUB_TOKEN/GITHUB_REPO not set — skipping GitHub Release")
         return
 
-    files = [f for f in OUTPUT_DIR.glob("*") if f.is_file()]
+    search_root = base_dir or get_output_dir()
+    files = [f for f in search_root.rglob("*") if f.is_file()]
     if not files:
-        logger.info("No output files to attach — skipping GitHub Release")
+        logger.info("No output files found — skipping GitHub Release")
         return
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -158,9 +177,8 @@ def create_github_release(tag: str | None = None) -> None:
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    logger.info(f"Creating GitHub Release {release_tag} in {repo} ...")
+    logger.info(f"Creating GitHub Release {release_tag} in {repo} with {len(files)} assets...")
     with httpx.Client(timeout=30.0) as client:
-        # 1. Create the release
         resp = client.post(
             f"{_GH_API}/repos/{repo}/releases",
             headers=headers,
@@ -170,9 +188,9 @@ def create_github_release(tag: str | None = None) -> None:
                 "body": (
                     "## Automated vulnerability remediation results\n\n"
                     "### Attached artifacts\n"
-                    "- `scan-iter-N.json` — Trivy JSON output per iteration\n"
-                    "- `report-iter-N.md` — Claude Opus 4.8 remediation report per iteration\n"
-                    "- `dockerfile-iter-N` — Generated patch Dockerfile per iteration\n"
+                    "- `<image>--scan-iter-N.json` — Trivy JSON per iteration\n"
+                    "- `<image>--report-iter-N.md` — Claude Opus 4.8 report per iteration\n"
+                    "- `<image>--dockerfile-iter-N` — Applied patch Dockerfile\n"
                 ),
                 "draft": False,
                 "prerelease": True,
@@ -183,25 +201,29 @@ def create_github_release(tag: str | None = None) -> None:
             return
 
         release = resp.json()
-        release_url = release.get("html_url", "")
-        upload_url = release["upload_url"].split("{")[0]  # strip "{?name,label}"
-        logger.info(f"Release created: {release_url}")
+        upload_url = release["upload_url"].split("{")[0]
+        logger.info(f"Release created: {release.get('html_url', '')}")
 
-        # 2. Upload each file as a release asset
-        upload_headers = {**headers, "Content-Type": "application/octet-stream"}
+        upload_headers = dict(headers)
         for f in sorted(files):
-            ct, _ = mimetypes.guess_type(f.name)
-            if ct:
-                upload_headers["Content-Type"] = ct
+            # Flatten subdirectory path into asset name using "--" as separator
+            try:
+                rel = f.relative_to(search_root)
+                asset_name = str(rel).replace("/", "--").replace("\\", "--").replace(" ", "_")
+            except ValueError:
+                asset_name = f.name
 
-            data = f.read_bytes()
+            ct, _ = mimetypes.guess_type(f.name)
+            upload_headers["Content-Type"] = ct or "application/octet-stream"
+
+            data_bytes = f.read_bytes()
             up = client.post(
-                f"{upload_url}?name={f.name}",
+                f"{upload_url}?name={asset_name}",
                 headers=upload_headers,
-                content=data,
+                content=data_bytes,
                 timeout=60.0,
             )
             if up.status_code in (200, 201):
-                logger.info(f"  Uploaded asset: {f.name} ({len(data)} bytes)")
+                logger.info(f"  ✓ {asset_name} ({len(data_bytes):,} bytes)")
             else:
-                logger.warning(f"  Asset upload failed for {f.name}: {up.status_code}")
+                logger.warning(f"  ✗ {asset_name}: {up.status_code}")

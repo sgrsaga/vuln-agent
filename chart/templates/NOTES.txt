@@ -1,0 +1,49 @@
+vuln-agent has been installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  SCHEDULED SCAN
+  Next run: {{ .Values.schedule }} ({{ .Values.timeZone }})
+  Discovery covers ALL namespaces except:
+  → {{ include "vuln-agent.excludedNamespaces" . }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  TRIGGER A MANUAL SCAN NOW
+  Run without waiting for the schedule:
+
+    kubectl -n {{ .Release.Namespace }} create job vuln-scan-manual \
+      --from=cronjob/{{ include "vuln-agent.fullname" . }}
+
+  Watch live progress:
+
+    kubectl -n {{ .Release.Namespace }} logs -f \
+      $(kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name={{ include "vuln-agent.name" . }} \
+        --sort-by=.metadata.creationTimestamp -o name | tail -1)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ARTIFACTS
+  Scan JSON, reports, and patch Dockerfiles are written to the
+  PVC "{{ printf "%s-output" (include "vuln-agent.fullname" .) }}" ({{ .Values.persistence.output.size }}).
+
+{{- if .Values.github.repo }}
+  A GitHub Release is created in {{ .Values.github.repo }} at the end of
+  each run with all artifacts attached as downloadable assets.
+{{- else }}
+  ⚠  github.repo is not set — GitHub Releases are disabled.
+     Set it with: helm upgrade {{ .Release.Name }} ./chart --set github.repo=owner/repo
+{{- end }}
+
+{{- if not .Values.registry.namespace }}
+  ⚠  registry.namespace is not set — patched images will be built locally
+     but NOT pushed to a registry. Set it to enable registry push.
+{{- else }}
+  Patched images are pushed to: {{ .Values.registry.namespace }}/<name>:<tag>-patched-iterN
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  LIST ALL SCAN JOBS
+
+    kubectl -n {{ .Release.Namespace }} get jobs -l app.kubernetes.io/name={{ include "vuln-agent.name" . }}
