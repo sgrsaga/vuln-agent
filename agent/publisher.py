@@ -142,6 +142,52 @@ def publish_event(event_type: str, message: str, data: dict | None = None) -> No
     _md(f"\n> {message}\n")
 
 
+def publish_go_analysis(image_ref: str, iteration: int, go_analysis: dict) -> None:
+    """Save govulncheck classification results to go-analysis-iter-N.json."""
+    out = get_output_dir()
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Strip heavy fields before serialising (analysis key is already on each vuln)
+    def _slim(vulns: list[dict]) -> list[dict]:
+        keep = ("id", "severity", "package", "installed", "fixed", "target", "analysis")
+        return [{k: v[k] for k in keep if k in v} for v in vulns]
+
+    data = {
+        "image_ref": image_ref,
+        "iteration": iteration,
+        "timestamp": _now(),
+        "summary": {
+            "false_positives": len(go_analysis.get("false_positives", [])),
+            "unexploitable": len(go_analysis.get("unexploitable", [])),
+            "confirmed": len(go_analysis.get("confirmed", [])),
+            "skipped": len(go_analysis.get("skipped", [])),
+        },
+        "false_positives": _slim(go_analysis.get("false_positives", [])),
+        "unexploitable": _slim(go_analysis.get("unexploitable", [])),
+        "confirmed": _slim(go_analysis.get("confirmed", [])),
+        "skipped": _slim(go_analysis.get("skipped", [])),
+    }
+    path = out / f"go-analysis-iter-{iteration}.json"
+    path.write_text(json.dumps(data, indent=2))
+    logger.info(f"Go analysis saved → {path}")
+
+    # Append summary to GitHub Step Summary
+    s = data["summary"]
+    _md(f"\n### 🔬 Go Binary Analysis — Iteration {iteration}\n")
+    _md(
+        f"| Classification | Count | Meaning |\n"
+        f"|----------------|-------|---------|\n"
+        f"| False positive | {s['false_positives']} | Built with fixed toolchain — suppress in scanner |\n"
+        f"| Unexploitable  | {s['unexploitable']} | Symbol present but not reachable — risk-accept |\n"
+        f"| Confirmed      | {s['confirmed']} | Reachable — requires source rebuild |\n"
+        f"| Skipped        | {s['skipped']} | Binary not extractable / tools unavailable |\n"
+    )
+    if go_analysis.get("false_positives"):
+        _md("\n**False positives (suppress these in your scanner policy):**\n")
+        for v in go_analysis["false_positives"]:
+            _md(f"- `{v['id']}` in `{v['package']}` — {v['analysis']['reason']}")
+
+
 def create_github_release(base_dir: Path | None = None, tag: str | None = None) -> None:
     """
     Create a GitHub Release via REST API and upload all output files as assets.

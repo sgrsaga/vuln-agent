@@ -30,6 +30,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Go toolchain for `go version` (embedded version detection) and govulncheck
+# (call-graph analysis of Go binaries to distinguish false positives from real CVEs).
+# Using a build arg so the version can be pinned at image build time.
+ARG GOVERSION=1.24.4
+ENV GOPATH=/go
+ENV PATH="/usr/local/go/bin:/go/bin:${PATH}"
+RUN curl -fsSL "https://go.dev/dl/go${GOVERSION}.linux-amd64.tar.gz" \
+        | tar -C /usr/local -xz \
+    && go install golang.org/x/vuln/cmd/govulncheck@latest \
+    # Remove source cache but keep the compiled govulncheck binary
+    && rm -rf /go/pkg /root/.cache/go-build \
+    # Make /go/bin readable by all users (agent runs as non-root)
+    && chmod -R 755 /go/bin
+
 # Copy pre-built Python packages from deps stage
 COPY --from=deps /install /usr/local
 
