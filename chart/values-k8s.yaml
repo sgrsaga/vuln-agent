@@ -1,0 +1,68 @@
+image:
+  repository: ghcr.io/sgrsaga/vuln-agent
+  tag: latest
+  pullPolicy: Always
+
+anthropic:
+  apiKey: "ANTHROPIC_KEY_REDACTED"
+
+github:
+  token: "GHP_TOKEN_REDACTED"
+  repo: "sgrsaga/vuln-agent"
+
+registry:
+  namespace: "ghcr.io/sgrsaga"
+  server: "ghcr.io"
+  username: "sgrsaga"
+  password: "GHP_TOKEN_REDACTED"
+
+discovery:
+  targetNamespaces:
+    - argocd
+    - monitoring
+  excludedNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+  includeInitContainers: false
+
+scan:
+  maxIterations: 3
+
+# Run every day at 02:00 UTC (or trigger manually via kubectl create job)
+schedule: "0 2 * * *"
+timeZone: "UTC"
+concurrencyPolicy: Forbid
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+
+persistence:
+  output:
+    size: 10Gi
+    storageClass: "harvester"
+    accessMode: ReadWriteOnce
+  trivyCache:
+    size: 5Gi
+    storageClass: "harvester"
+    accessMode: ReadWriteOnce
+
+docker:
+  dind: true
+  dindImage: "docker:27-dind"
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "4"
+    memory: "4Gi"
+
+serviceAccount:
+  create: true
+
+rbac:
+  create: true
+
+dockerSocket:
+  hostPath: /var/run/docker.sock

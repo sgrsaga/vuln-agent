@@ -11,6 +11,11 @@ Push policy (enforced by orchestrator):
   Images are pushed ONLY when a Trivy rescan of the locally built image
   shows a net reduction in HIGH/CRITICAL CVEs vs the previous iteration.
   This ensures clean-only images enter the registry.
+
+Docker availability:
+  When Docker daemon is unavailable (e.g. k8s pod without socket mount),
+  docker_available() returns False. The orchestrator skips building and
+  only reports the generated Dockerfile for developer use.
 """
 
 import os
@@ -21,6 +26,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 GHCR_NAMESPACE = (os.environ.get("GHCR_NAMESPACE") or "").rstrip("/")
+
+
+def docker_available() -> bool:
+    """Return True if the Docker daemon is reachable."""
+    try:
+        r = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=5,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def _image_name(image_ref: str) -> str:

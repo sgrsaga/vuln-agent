@@ -54,19 +54,9 @@ def analyze_go_vulns(image_ref: str, go_vulns: list[dict]) -> dict:
     for v in go_vulns:
         by_target.setdefault(v.get("target", ""), []).append(v)
 
-    container_id = _create_container(image_ref)
-    if not container_id:
-        for v in go_vulns:
-            v["analysis"] = {"status": "skipped", "reason": "docker create failed — cannot extract binaries"}
-            result["skipped"].append(v)
-        return result
-
     with tempfile.TemporaryDirectory(prefix="vuln-go-") as tmpdir:
-        try:
-            for target, vulns in by_target.items():
-                _analyze_target(container_id, target, vulns, tmpdir, result)
-        finally:
-            _remove_container(container_id)
+        for target, vulns in by_target.items():
+            _analyze_target(image_ref, target, vulns, tmpdir, result)
 
     fp = len(result["false_positives"])
     un = len(result["unexploitable"])
@@ -100,51 +90,48 @@ def _tools_available() -> bool:
     return shutil.which("govulncheck") is not None
 
 
-# ── Container helpers ──────────────────────────────────────────────────────────
+# ── Binary extraction via crane (no Docker daemon required) ───────────────────
 
-def _create_container(image_ref: str) -> str | None:
-    """Create a stopped container and return its ID (or None on failure)."""
-    try:
-        r = subprocess.run(
-            ["docker", "create", image_ref],
-            capture_output=True, text=True, timeout=120,
-        )
-        cid = r.stdout.strip()
-        if r.returncode != 0 or not cid:
-            logger.warning(f"docker create failed: {r.stderr.strip()}")
-            return None
-        logger.debug(f"Created container {cid[:12]} from {image_ref}")
-        return cid
-    except Exception as exc:
-        logger.warning(f"docker create error: {exc}")
-        return None
+def _extract_binary(image_ref: str, binary_path: str, tmpdir: str) -> Path | None:
+    """
+    Extract a single binary from an OCI image using crane export.
 
+    crane pulls the merged image filesystem as a tar stream without needing a
+    Docker daemon — it speaks directly to the OCI registry. The tar is piped
+    to `tar -xOf - <path>` which writes only the requested file to stdout.
 
-def _remove_container(container_id: str) -> None:
-    try:
-        subprocess.run(
-            ["docker", "rm", "-f", container_id],
-            capture_output=True, timeout=30,
-        )
-    except Exception:
-        pass
-
-
-def _extract_binary(container_id: str, binary_path: str, tmpdir: str) -> Path | None:
-    """Copy a binary out of the stopped container; return local Path or None."""
+    binary_path must be an absolute path inside the image (e.g. /usr/bin/argocd).
+    """
     local = Path(tmpdir) / Path(binary_path).name
+    path_in_tar = binary_path.lstrip("/")
     try:
-        r = subprocess.run(
-            ["docker", "cp", f"{container_id}:{binary_path}", str(local)],
-            capture_output=True, text=True, timeout=60,
+        crane_proc = subprocess.Popen(
+            ["crane", "export", image_ref, "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        if r.returncode != 0:
-            logger.debug(f"docker cp {binary_path} failed: {r.stderr.strip()}")
+        with open(local, "wb") as out_fh:
+            tar_proc = subprocess.run(
+                ["tar", "-xOf", "-", path_in_tar],
+                stdin=crane_proc.stdout,
+                stdout=out_fh,
+                stderr=subprocess.PIPE,
+                timeout=300,
+            )
+        crane_proc.stdout.close()
+        crane_proc.wait(timeout=10)
+
+        if tar_proc.returncode != 0 or not local.exists() or local.stat().st_size == 0:
+            logger.debug(
+                f"crane/tar extraction failed for {binary_path}: "
+                f"tar rc={tar_proc.returncode}, "
+                f"crane stderr={crane_proc.stderr.read(200) if crane_proc.stderr else ''}"
+            )
             return None
         local.chmod(0o755)
         return local
     except Exception as exc:
-        logger.debug(f"docker cp error for {binary_path}: {exc}")
+        logger.debug(f"crane extraction error for {binary_path}: {exc}")
         return None
 
 
@@ -244,18 +231,18 @@ def _run_govulncheck(binary: Path) -> tuple[set[str], set[str], str]:
 # ── Per-target analysis ────────────────────────────────────────────────────────
 
 def _analyze_target(
-    container_id: str,
+    image_ref: str,
     target: str,
     vulns: list[dict],
     tmpdir: str,
     result: dict,
 ) -> None:
-    local_binary = _extract_binary(container_id, target, tmpdir)
+    local_binary = _extract_binary(image_ref, target, tmpdir)
     if not local_binary:
         for v in vulns:
             v["analysis"] = {
                 "status": "skipped",
-                "reason": f"Could not extract binary from container path: {target}",
+                "reason": f"crane: could not extract {target} from {image_ref}",
             }
             result["skipped"].append(v)
         return

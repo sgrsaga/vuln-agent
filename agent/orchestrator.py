@@ -24,7 +24,7 @@ import os
 from .scanner import scan_image, extract_vulnerabilities
 from .reporter import generate_report
 from .patcher import generate_patch
-from .builder import build_image, push_image
+from .builder import build_image, push_image, docker_available
 from .go_analyzer import analyze_go_vulns, summary_line as go_summary
 from . import publisher
 from .publisher import publish_scan, publish_report, publish_event, publish_go_analysis
@@ -179,7 +179,19 @@ def run(image_ref: str, create_release: bool = True) -> dict:
         publish_event("patch_generated",
             f"Dockerfile saved → {df_path.name} ({len(dockerfile.splitlines())} lines)")
 
-        # ── 4. Build locally (push deferred until improvement confirmed) ──────
+        # ── 4. Build (only when Docker daemon is available) ───────────────────
+        if not docker_available():
+            publish_event(
+                "build_skipped",
+                f"⚠️  Docker daemon not available — skipping build in this environment. "
+                f"The Dockerfile has been saved to {df_path.name} for local developer use. "
+                f"Go binary CVEs require source rebuilds; see the report for instructions.",
+                {"dockerfile": str(df_path), "remaining_vulns": len(effective_vulns)},
+            )
+            # Continue to next iteration only for OS-layer vulns (no Go binary changes)
+            # When no Docker, stop after generating the first Dockerfile
+            return _done("no_docker", current_image, iteration, len(effective_vulns), create_release)
+
         publish_event("build_start",
             f"Building patched image locally (iteration {iteration}) — "
             "will push only if CVEs improve ...")

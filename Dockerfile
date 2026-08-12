@@ -4,6 +4,15 @@
 FROM golang:1.25 AS gotools
 RUN CGO_ENABLED=0 go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 
+# Download pre-built crane binary from GitHub releases (avoids Go module proxy instability)
+FROM debian:bookworm-slim AS crane-dl
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    CRANE_VERSION=$(curl -s https://api.github.com/repos/google/go-containerregistry/releases/latest | \
+        grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/') && \
+    curl -sL "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+        | tar -xzf - -C /usr/local/bin crane && \
+    chmod +x /usr/local/bin/crane
+
 
 # ── Stage 1: Python dependencies ────────────────────────────────────────────
 FROM python:3.12-slim AS deps
@@ -45,6 +54,7 @@ COPY --from=deps /install /usr/local
 # No Go toolchain needed at runtime — govulncheck's JSON output includes the
 # embedded Go version via the SBOM record, so `go version <binary>` is not used.
 COPY --from=gotools /go/bin/govulncheck /usr/local/bin/govulncheck
+COPY --from=crane-dl /usr/local/bin/crane /usr/local/bin/crane
 
 # Copy application source
 WORKDIR /app

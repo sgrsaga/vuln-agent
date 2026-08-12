@@ -106,11 +106,16 @@ rbac:
   # Creates a ClusterRole + ClusterRoleBinding for pod/namespace listing
   create: true
 
-# ── Docker socket ─────────────────────────────────────────────────────────
-# Required for docker build + docker push inside the pod.
-# For rootless builds consider replacing with a Kaniko sidecar.
-dockerSocket:
-  hostPath: /var/run/docker.sock
+# ── Docker (optional — required only for building patched images) ──────────
+# When Docker is unavailable (e.g. k8s pod without socket access), the agent
+# runs in analysis-only mode: it scans, classifies, and generates Dockerfiles
+# but skips the build+push step.
+# To enable building in k8s, mount the host Docker socket via extraVolumes or
+# run the agent on a Docker-capable host (outside k8s).
+docker:
+  # Set to the host Docker socket path to enable building in k8s (optional).
+  # Leave empty to run in analysis-only mode (safe default for most clusters).
+  hostSocketPath: ""
 
 # ── Pod-level settings ─────────────────────────────────────────────────────
 nodeSelector: {}

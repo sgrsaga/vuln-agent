@@ -24,7 +24,6 @@ spec:
           restartPolicy: Never
           serviceAccountName: {{ include "vuln-agent.serviceAccountName" . }}
 
-          # Pull the agent image from the private registry
           imagePullSecrets:
             - name: {{ include "vuln-agent.registrySecretName" . }}
 
@@ -42,10 +41,7 @@ spec:
               image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
 
-              # Discovery mode.
-              # When targetNamespaces is configured, pass --namespaces to
-              # restrict scanning to only those namespaces (whitelist).
-              # Otherwise scan cluster-wide minus excludedNamespaces.
+              # Discovery mode — whitelist if targetNamespaces is set.
               args:
                 - "--discover"
                 {{- with include "vuln-agent.targetNamespaces" . }}
@@ -80,16 +76,6 @@ spec:
 
               # ── Volume mounts ─────────────────────────────────────────────
               volumeMounts:
-                # Docker socket — required for docker build + docker push.
-                # For production consider a Kaniko sidecar instead.
-                - name: docker-socket
-                  mountPath: /var/run/docker.sock
-
-                # Registry auth so docker push can reach the private registry
-                - name: registry-config
-                  mountPath: /root/.docker
-                  readOnly: true
-
                 # Scan results, reports, patch Dockerfiles
                 - name: output
                   mountPath: /app/output
@@ -103,18 +89,6 @@ spec:
 
           # ── Volumes ───────────────────────────────────────────────────────
           volumes:
-            - name: docker-socket
-              hostPath:
-                path: {{ .Values.dockerSocket.hostPath }}
-                type: Socket
-
-            - name: registry-config
-              secret:
-                secretName: {{ include "vuln-agent.registrySecretName" . }}
-                items:
-                  - key: .dockerconfigjson
-                    path: config.json
-
             - name: output
               persistentVolumeClaim:
                 claimName: {{ printf "%s-output" (include "vuln-agent.fullname" .) }}
