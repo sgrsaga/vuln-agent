@@ -23,8 +23,9 @@ from .scanner import scan_image, extract_vulnerabilities
 from .reporter import generate_report
 from .patcher import generate_patch
 from .builder import build_and_push
+from .go_analyzer import analyze_go_vulns, summary_line as go_summary
 from . import publisher
-from .publisher import publish_scan, publish_report, publish_event
+from .publisher import publish_scan, publish_report, publish_event, publish_go_analysis
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,10 @@ def run(image_ref: str, create_release: bool = True) -> dict:
     current_image = image_ref
     iteration = 0
     previous_dockerfiles: list[str] = []
+
+    # go_analysis is computed once on the original image and reused for all
+    # iterations — Go binaries don't change when OS packages are patched.
+    go_analysis: dict | None = None
 
     publish_event("pipeline_start", f"Starting remediation for `{image_ref}`", {
         "image": image_ref,
@@ -83,10 +88,47 @@ def run(image_ref: str, create_release: bool = True) -> dict:
                 {"final_image": current_image, "iterations": iteration})
             return _done("clean", current_image, iteration, 0, create_release)
 
+        # ── 1b. Go binary analysis (first iteration only) ─────────────────────
+        # Run govulncheck on each affected binary to classify Go CVEs precisely.
+        # Results are cached — the binaries don't change between OS-layer patches.
+        go_vulns = [v for v in vulns if v["type"] == "gobinary"]
+        if go_vulns and go_analysis is None:
+            publish_event(
+                "go_analysis_start",
+                f"Running govulncheck on {len(go_vulns)} Go binary CVE(s) to identify "
+                "false positives and unreachable call paths …",
+            )
+            try:
+                go_analysis = analyze_go_vulns(current_image, go_vulns)
+                publish_go_analysis(image_ref, iteration, go_analysis)
+                publish_event(
+                    "go_analysis_complete",
+                    f"Go binary analysis: {go_summary(go_analysis)}",
+                    {
+                        "false_positives": len(go_analysis["false_positives"]),
+                        "unexploitable": len(go_analysis["unexploitable"]),
+                        "confirmed": len(go_analysis["confirmed"]),
+                        "skipped": len(go_analysis["skipped"]),
+                    },
+                )
+            except Exception as exc:
+                publish_event("error", f"Go binary analysis failed (non-fatal): {exc}")
+                go_analysis = {}  # empty dict — analysis unavailable but don't block
+
+        # Effective vuln count excludes govulncheck-confirmed false positives
+        fp_ids = {v["id"] for v in (go_analysis or {}).get("false_positives", [])}
+        effective_vulns = [v for v in vulns if v["id"] not in fp_ids]
+        if fp_ids:
+            publish_event(
+                "false_positives_suppressed",
+                f"Suppressing {len(fp_ids)} govulncheck false positive(s) — "
+                f"effective vulnerability count: {len(effective_vulns)}",
+            )
+
         # ── 2. Generate report ────────────────────────────────────────────────
         publish_event("report_start", "Generating recovery report with Claude Opus 4.8 ...")
         try:
-            report = generate_report(image_ref, iteration, vulns)
+            report = generate_report(image_ref, iteration, vulns, go_analysis or None)
         except Exception as exc:
             publish_event("error", f"Report generation failed: {exc}")
             report = f"*Report generation failed: {exc}*"
@@ -98,16 +140,36 @@ def run(image_ref: str, create_release: bool = True) -> dict:
         # ── 3. Generate patch Dockerfile ──────────────────────────────────────
         publish_event("patch_start", "Asking Claude to generate a patch Dockerfile ...")
         try:
-            dockerfile = generate_patch(current_image, iteration, vulns, previous_dockerfiles)
+            dockerfile = generate_patch(
+                current_image, iteration, vulns, previous_dockerfiles, go_analysis or None
+            )
         except Exception as exc:
             publish_event("error", f"Patch generation failed: {exc}")
-            return _done("patch_error", current_image, iteration, len(vulns), create_release)
+            return _done("patch_error", current_image, iteration, len(effective_vulns), create_release)
 
         if dockerfile is None:
-            publish_event("pipeline_complete",
-                "🏁 No further Dockerfile patches possible — remaining CVEs require source rebuild.",
-                {"final_image": current_image, "remaining_vulns": len(vulns), "iterations": iteration})
-            return _done("no_further_patches", current_image, iteration, len(vulns), create_release)
+            # Distinguish why we stopped: govulncheck may have reclassified most Go vulns
+            confirmed_go = len((go_analysis or {}).get("confirmed", []))
+            unexploitable_go = len((go_analysis or {}).get("unexploitable", []))
+            fp_go = len((go_analysis or {}).get("false_positives", []))
+            stop_msg = (
+                "🏁 No further Dockerfile patches possible. "
+                f"Remaining: {len(effective_vulns)} effective CVEs"
+            )
+            if go_analysis:
+                stop_msg += (
+                    f" ({confirmed_go} confirmed Go CVEs need source rebuild, "
+                    f"{unexploitable_go} unexploitable / risk-accepted, "
+                    f"{fp_go} Trivy false positives suppressed)"
+                )
+            else:
+                stop_msg += " (remaining CVEs require source rebuild)"
+            publish_event("pipeline_complete", stop_msg, {
+                "final_image": current_image,
+                "remaining_vulns": len(effective_vulns),
+                "iterations": iteration,
+            })
+            return _done("no_further_patches", current_image, iteration, len(effective_vulns), create_release)
 
         df_path = publisher.get_output_dir() / f"dockerfile-iter-{iteration}"
         df_path.write_text(dockerfile)
@@ -121,7 +183,7 @@ def run(image_ref: str, create_release: bool = True) -> dict:
             new_image = build_and_push(dockerfile, current_image, iteration)
         except Exception as exc:
             publish_event("error", f"Build failed: {exc}")
-            return _done("build_error", current_image, iteration, len(vulns), create_release)
+            return _done("build_error", current_image, iteration, len(effective_vulns), create_release)
 
         publish_event("build_complete", f"Built and pushed: `{new_image}`", {"image": new_image})
 
@@ -134,17 +196,22 @@ def run(image_ref: str, create_release: bool = True) -> dict:
             break
 
         new_vulns = extract_vulnerabilities(new_raw)
-        improvement = len(vulns) - len(new_vulns)
+        # Compare using effective counts (false positives excluded) so that
+        # reclassified Trivy noise doesn't mask real improvements
+        new_fp_ids = {v["id"] for v in (go_analysis or {}).get("false_positives", [])}
+        new_effective = [v for v in new_vulns if v["id"] not in new_fp_ids]
+        improvement = len(effective_vulns) - len(new_effective)
 
         if improvement <= 0:
             publish_event("no_improvement",
-                f"⚠️  Patch did not reduce vulnerabilities ({len(vulns)} → {len(new_vulns)}). Stopping.",
-                {"before": len(vulns), "after": len(new_vulns)})
-            return _done("no_improvement", new_image, iteration, len(new_vulns), create_release)
+                f"⚠️  Patch did not reduce effective vulnerabilities "
+                f"({len(effective_vulns)} → {len(new_effective)}). Stopping.",
+                {"before": len(effective_vulns), "after": len(new_effective)})
+            return _done("no_improvement", new_image, iteration, len(new_effective), create_release)
 
         publish_event("improvement",
-            f"✅ Reduced by {improvement}: {len(vulns)} → {len(new_vulns)} CVEs",
-            {"before": len(vulns), "after": len(new_vulns), "fixed": improvement})
+            f"✅ Reduced by {improvement}: {len(effective_vulns)} → {len(new_effective)} effective CVEs",
+            {"before": len(effective_vulns), "after": len(new_effective), "fixed": improvement})
 
         current_image = new_image
 
