@@ -23,6 +23,8 @@ spec:
         spec:
           restartPolicy: Never
           serviceAccountName: {{ include "vuln-agent.serviceAccountName" . }}
+          securityContext:
+            fsGroup: 999   # matches the "agent" GID in the container image
 
           imagePullSecrets:
             - name: {{ include "vuln-agent.registrySecretName" . }}

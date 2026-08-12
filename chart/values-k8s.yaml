@@ -3,18 +3,22 @@ image:
   tag: latest
   pullPolicy: Always
 
+# Credentials are managed via SealedSecrets (chart/sealed-secrets.yaml).
+# Apply them before deploying:
+#   kubectl apply -f chart/sealed-secrets.yaml
 anthropic:
-  apiKey: "ANTHROPIC_KEY_REDACTED"
+  existingSecret: "vuln-agent-secrets"
+  existingSecretKey: "anthropic-api-key"
 
 github:
-  token: "GHP_TOKEN_REDACTED"
+  existingSecret: "vuln-agent-secrets"
+  existingSecretKey: "github-token"
   repo: "sgrsaga/vuln-agent"
 
 registry:
   namespace: "ghcr.io/sgrsaga"
   server: "ghcr.io"
-  username: "sgrsaga"
-  password: "GHP_TOKEN_REDACTED"
+  existingSecret: "vuln-agent-registry"
 
 discovery:
   targetNamespaces:
@@ -46,10 +50,6 @@ persistence:
     storageClass: "harvester"
     accessMode: ReadWriteOnce
 
-docker:
-  dind: true
-  dindImage: "docker:27-dind"
-
 resources:
   requests:
     cpu: "500m"
@@ -63,6 +63,3 @@ serviceAccount:
 
 rbac:
   create: true
-
-dockerSocket:
-  hostPath: /var/run/docker.sock
