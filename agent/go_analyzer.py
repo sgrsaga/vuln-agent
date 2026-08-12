@@ -170,35 +170,45 @@ def _get_go_version(binary: Path) -> str:
 
 def _parse_govulncheck_json(stdout: str) -> tuple[set[str], dict[str, set[str]]]:
     """
-    Parse a govulncheck JSON stream.
+    Parse govulncheck -json output (multi-line pretty-printed objects, NOT NDJSON).
+
+    govulncheck v1.6.0 outputs a stream of concatenated JSON objects — each is
+    pretty-printed across multiple lines. Top-level keys are the record types:
+      {"config": {...}}
+      {"progress": {...}}
+      {"osv": {"id": "GO-XXXX", "aliases": ["CVE-XXXX"], ...}}
+      {"finding": {"osv": "GO-XXXX", "trace": [...]}}
 
     Returns:
-        found_osv_ids   – OSV IDs that appear in "finding" messages
+        found_osv_ids   – OSV IDs that appear in "finding" records
         alias_map       – maps each OSV ID to its full set of aliases (incl. CVE IDs)
     """
     found_osv: set[str] = set()
     alias_map: dict[str, set[str]] = {}
 
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    decoder = json.JSONDecoder()
+    pos = 0
+    stdout = stdout.strip()
+    while pos < len(stdout):
         try:
-            obj = json.loads(line)
+            obj, idx = decoder.raw_decode(stdout, pos)
+            pos = idx
+            # Skip whitespace between objects
+            while pos < len(stdout) and stdout[pos] in " \n\r\t":
+                pos += 1
         except json.JSONDecodeError:
+            pos += 1
             continue
 
-        msg = obj.get("message", {})
-
-        # OSV record: contains the canonical ID and CVE aliases
-        osv_rec = msg.get("osv")
+        # OSV record: canonical vulnerability definition with aliases
+        osv_rec = obj.get("osv")
         if isinstance(osv_rec, dict):
             osv_id = osv_rec.get("id", "")
             aliases: set[str] = set(osv_rec.get("aliases", []))
             alias_map[osv_id] = aliases | {osv_id}
 
-        # Finding record: the OSV ID of a vulnerability found in the binary
-        finding = msg.get("finding")
+        # Finding record: govulncheck detected this vulnerability in the binary
+        finding = obj.get("finding")
         if isinstance(finding, dict):
             osv_id = finding.get("osv", "")
             if osv_id:
@@ -218,43 +228,35 @@ def _expand_ids(osv_ids: set[str], alias_map: dict[str, set[str]]) -> set[str]:
 def _run_govulncheck(binary: Path) -> tuple[set[str], set[str]]:
     """
     Run govulncheck in binary mode and return:
-        (reachable_ids, all_ids)
+        (confirmed_ids, confirmed_ids)   ← both sets are identical in binary mode
 
-    reachable_ids – CVE / OSV IDs where the vulnerable symbol IS in the call graph
-    all_ids       – all CVE / OSV IDs present in the binary (called or not)
+    In binary mode govulncheck uses the binary's symbol table and call graph
+    (from DWARF debug info) to detect whether vulnerable symbols are present.
+    The `-show all` flag is not supported with JSON output, and in practice
+    binary mode already returns all reachable findings by default — testing
+    shows the default JSON output and `-show all` text output produce identical
+    counts.  Therefore we run a single JSON pass:
+        • CVE in findings → "confirmed" (vulnerable symbol detected in binary)
+        • CVE NOT in findings → "false_positive" (not present / fixed toolchain)
 
-    Both sets include CVE aliases so they can be matched against Trivy output.
+    The "unexploitable" category (symbol present but call path unreachable) is
+    meaningful only in source mode; binary mode cannot make that distinction.
+
+    Returns (confirmed_ids, confirmed_ids) so callers that compare
+    reachable vs all get consistent behaviour without changing the call site.
     """
-    base = ["govulncheck", "-mode", "binary", "-json"]
-
-    # Pass 1: reachable symbols only (default behaviour)
-    reachable_osv: set[str] = set()
-    alias_map: dict[str, set[str]] = {}
     try:
-        r1 = subprocess.run(base + [str(binary)], capture_output=True, text=True, timeout=180)
-        reachable_osv, alias_map = _parse_govulncheck_json(r1.stdout)
-    except Exception as exc:
-        logger.warning(f"govulncheck (reachable) failed on {binary.name}: {exc}")
-
-    # Pass 2: all symbols, including unreachable
-    all_osv: set[str] = set()
-    try:
-        r2 = subprocess.run(
-            base + ["-show", "all", str(binary)],
+        r = subprocess.run(
+            ["govulncheck", "-mode", "binary", "-json", str(binary)],
             capture_output=True, text=True, timeout=180,
         )
-        all_osv_raw, alias_map2 = _parse_govulncheck_json(r2.stdout)
-        # Merge alias maps (pass 2 may contain more OSV records)
-        alias_map.update(alias_map2)
-        all_osv = all_osv_raw
+        found_osv, alias_map = _parse_govulncheck_json(r.stdout)
     except Exception as exc:
-        logger.warning(f"govulncheck (all) failed on {binary.name}: {exc}")
-        all_osv = set(reachable_osv)
+        logger.warning(f"govulncheck failed on {binary.name}: {exc}")
+        found_osv, alias_map = set(), {}
 
-    return (
-        _expand_ids(reachable_osv, alias_map),
-        _expand_ids(all_osv, alias_map),
-    )
+    confirmed = _expand_ids(found_osv, alias_map)
+    return confirmed, confirmed  # both identical — no unexploitable in binary mode
 
 
 # ── Per-target analysis ────────────────────────────────────────────────────────
@@ -289,45 +291,32 @@ def _analyze_target(
         ver_tag = f"Go {go_ver}" if go_ver else "unknown Go version"
 
         if cve_id not in all_ids:
-            # govulncheck found no evidence of this CVE in the binary at all.
-            # Most likely the binary was built with a toolchain version that already
-            # contains the fix, making this a Trivy false positive.
+            # govulncheck found no trace of this CVE in the binary.
+            # The binary was built with a toolchain or dependency version that
+            # already contains the fix — Trivy version-range matching is a false
+            # positive here.
             v["analysis"] = {
                 "status": "false_positive",
                 "go_version": go_ver,
                 "reason": (
-                    f"govulncheck: {cve_id} is NOT present in this binary ({ver_tag}). "
-                    "The binary was likely compiled with a Go toolchain or dependency "
-                    "version that already includes the fix. "
+                    f"govulncheck: {cve_id} not detected in binary ({ver_tag}). "
+                    "Binary was compiled with a fixed toolchain/dependency. "
                     "Suppress this finding in your scanner policy."
                 ),
             }
             result["false_positives"].append(v)
 
-        elif cve_id not in reachable_ids:
-            # The CVE's package is compiled into the binary but the specific vulnerable
-            # symbol is never called — the call graph does not reach it.
-            v["analysis"] = {
-                "status": "unexploitable",
-                "go_version": go_ver,
-                "reason": (
-                    f"govulncheck: {cve_id} is present in the binary ({ver_tag}) "
-                    "but the vulnerable symbol is NOT reachable from any entry point "
-                    "in the call graph. Not exploitable via this binary as compiled. "
-                    "Treat as risk-accepted; document and monitor for upstream fix."
-                ),
-            }
-            result["unexploitable"].append(v)
-
         else:
-            # Confirmed: the vulnerable symbol exists in the binary AND is reachable.
+            # govulncheck found the vulnerable symbol in the binary's call graph.
+            # In binary mode there is no 'unexploitable' distinction — any detected
+            # symbol is treated as confirmed present and potentially exploitable.
             v["analysis"] = {
                 "status": "confirmed",
                 "go_version": go_ver,
                 "reason": (
-                    f"govulncheck: {cve_id} CONFIRMED — vulnerable symbol is reachable "
-                    f"in the call graph ({ver_tag}). "
-                    "Requires a source rebuild with the patched Go toolchain or dependency. "
+                    f"govulncheck: {cve_id} CONFIRMED — vulnerable symbol detected "
+                    f"in binary ({ver_tag}). "
+                    "Requires source rebuild with patched Go toolchain or dependency. "
                     "Cannot be fixed at the image layer."
                 ),
             }
