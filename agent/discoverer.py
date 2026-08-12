@@ -17,22 +17,34 @@ logger = logging.getLogger(__name__)
 
 
 def discover_images(
-    excluded_namespaces: list[str],
+    excluded_namespaces: list[str] | None = None,
     include_init_containers: bool = False,
+    target_namespaces: list[str] | None = None,
 ) -> list[str]:
     """
-    Return a sorted, deduplicated list of container image references found
-    across all non-excluded namespaces in the cluster.
+    Return a sorted, deduplicated list of container image references.
+
+    Namespace selection (mutually exclusive, target takes priority):
+      target_namespaces  – whitelist: scan ONLY these namespaces.
+      excluded_namespaces – blacklist: scan all EXCEPT these (+ agent ns).
+      If target_namespaces is non-empty, excluded_namespaces is ignored.
     """
-    excluded = set(excluded_namespaces)
+    targets = [ns.strip() for ns in (target_namespaces or []) if ns.strip()]
+    excluded = set(excluded_namespaces or [])
+
+    if targets:
+        logger.info(f"Target namespaces (whitelist): {', '.join(targets)}")
+    elif excluded:
+        logger.info(f"Excluded namespaces: {', '.join(sorted(excluded))}")
+
     try:
-        return _via_client(excluded, include_init_containers)
+        return _via_client(excluded, include_init_containers, targets)
     except ImportError:
         logger.warning("kubernetes Python client not installed — falling back to kubectl")
-        return _via_kubectl(excluded, include_init_containers)
+        return _via_kubectl(excluded, include_init_containers, targets)
 
 
-def _via_client(excluded: set[str], include_init: bool) -> list[str]:
+def _via_client(excluded: set[str], include_init: bool, targets: list[str]) -> list[str]:
     from kubernetes import client, config  # noqa: PLC0415
 
     try:
@@ -50,7 +62,11 @@ def _via_client(excluded: set[str], include_init: bool) -> list[str]:
 
     for pod in pods.items:
         ns = pod.metadata.namespace
-        if ns in excluded:
+        # Whitelist mode: only scan target namespaces
+        if targets and ns not in targets:
+            continue
+        # Blacklist mode: skip excluded namespaces
+        if not targets and ns in excluded:
             skipped_ns.add(ns)
             continue
         for c in pod.spec.containers or []:
@@ -67,7 +83,7 @@ def _via_client(excluded: set[str], include_init: bool) -> list[str]:
     return sorted(images)
 
 
-def _via_kubectl(excluded: set[str], include_init: bool) -> list[str]:
+def _via_kubectl(excluded: set[str], include_init: bool, targets: list[str]) -> list[str]:
     result = subprocess.run(
         ["kubectl", "get", "pods", "--all-namespaces", "-o", "json"],
         capture_output=True,
@@ -82,7 +98,9 @@ def _via_kubectl(excluded: set[str], include_init: bool) -> list[str]:
 
     for pod in data.get("items", []):
         ns = pod["metadata"]["namespace"]
-        if ns in excluded:
+        if targets and ns not in targets:
+            continue
+        if not targets and ns in excluded:
             continue
         spec = pod.get("spec", {})
         for c in spec.get("containers", []):

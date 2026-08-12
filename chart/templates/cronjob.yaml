@@ -42,8 +42,18 @@ spec:
               image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
 
-              # Discovery mode: scan every image running in the cluster
-              args: ["--discover"]
+              # Discovery mode.
+              # When targetNamespaces is configured, pass --namespaces to
+              # restrict scanning to only those namespaces (whitelist).
+              # Otherwise scan cluster-wide minus excludedNamespaces.
+              args:
+                - "--discover"
+                {{- with include "vuln-agent.targetNamespaces" . }}
+                {{- if . }}
+                - "--namespaces"
+                - {{ . | quote }}
+                {{- end }}
+                {{- end }}
 
               # ── Config from ConfigMap ─────────────────────────────────────
               envFrom:

@@ -37,8 +37,19 @@ registry:
 
 # ── Image discovery ────────────────────────────────────────────────────────
 discovery:
-  # Namespaces to exclude from image discovery.
-  # The agent's own release namespace is automatically excluded.
+  # TARGET NAMESPACES (whitelist — recommended for developer environments)
+  # When set, ONLY these namespaces are scanned.
+  # The agent's release namespace is never included even if listed here.
+  # Leave empty ([]) to fall back to the excludedNamespaces blacklist.
+  targetNamespaces: []
+  # Examples:
+  #   targetNamespaces:
+  #     - argocd
+  #     - monitoring
+  #     - staging
+
+  # EXCLUDED NAMESPACES (blacklist — used only when targetNamespaces is empty)
+  # The agent's own release namespace is always appended automatically.
   excludedNamespaces:
     - kube-system
     - kube-public
