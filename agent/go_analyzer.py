@@ -4,22 +4,20 @@ Go binary vulnerability analyzer.
 For each gobinary CVE found by Trivy, this module:
   1. Creates a stopped container from the image (docker create)
   2. Copies each affected binary out via docker cp
-  3. Reads the embedded Go toolchain version (go version <binary>)
-  4. Runs govulncheck -mode binary twice:
-       - default:      only symbols reachable via the call graph → CONFIRMED
-       - --show all:   all symbols present in binary           → includes UNEXPLOITABLE
-  5. Classifies each CVE as one of:
+  3. Runs govulncheck -mode binary -json; parses the SBOM record for Go version
+  4. Classifies each CVE as one of:
        false_positive  – govulncheck finds NO trace of the CVE at all
                          (binary was built with a patched toolchain/dependency)
-       unexploitable   – CVE present in binary but the vulnerable symbol is
-                         NOT reachable from any entry point in the call graph
-       confirmed       – vulnerable symbol IS in the call graph → genuinely exploitable
-       skipped         – could not extract binary or tools unavailable
+       confirmed       – vulnerable symbol IS present in the binary
+       skipped         – could not extract binary or govulncheck unavailable
+
+Note: "unexploitable" (symbol present but call path unreachable) is only
+meaningful in source mode; binary mode treats all findings as confirmed.
 
 Returns:
     {
         "false_positives": [...vulns, each with "analysis" key],
-        "unexploitable":   [...vulns, each with "analysis" key],
+        "unexploitable":   [],
         "confirmed":       [...vulns, each with "analysis" key],
         "skipped":         [...vulns, each with "analysis" key],
     }
@@ -99,7 +97,7 @@ def summary_line(go_analysis: dict) -> str:
 # ── Tool availability ──────────────────────────────────────────────────────────
 
 def _tools_available() -> bool:
-    return shutil.which("go") is not None and shutil.which("govulncheck") is not None
+    return shutil.which("govulncheck") is not None
 
 
 # ── Container helpers ──────────────────────────────────────────────────────────
@@ -150,41 +148,27 @@ def _extract_binary(container_id: str, binary_path: str, tmpdir: str) -> Path | 
         return None
 
 
-# ── Go version extraction ──────────────────────────────────────────────────────
-
-def _get_go_version(binary: Path) -> str:
-    """Return embedded Go version like '1.26.4', or '' on failure."""
-    try:
-        r = subprocess.run(
-            ["go", "version", str(binary)],
-            capture_output=True, text=True, timeout=15,
-        )
-        # Output: "./argocd: go1.26.4 linux/amd64"
-        m = re.search(r"go(\d+\.\d+(?:\.\d+)?(?:-[^\s]+)?)", r.stdout)
-        return m.group(1) if m else ""
-    except Exception:
-        return ""
-
-
 # ── govulncheck execution + parsing ───────────────────────────────────────────
 
-def _parse_govulncheck_json(stdout: str) -> tuple[set[str], dict[str, set[str]]]:
+def _parse_govulncheck_json(stdout: str) -> tuple[set[str], dict[str, set[str]], str]:
     """
     Parse govulncheck -json output (multi-line pretty-printed objects, NOT NDJSON).
 
-    govulncheck v1.6.0 outputs a stream of concatenated JSON objects — each is
-    pretty-printed across multiple lines. Top-level keys are the record types:
+    govulncheck v1.6.0 outputs a stream of concatenated JSON objects:
       {"config": {...}}
       {"progress": {...}}
+      {"SBOM": {"go_version": "go1.26.4", "modules": [...]}}
       {"osv": {"id": "GO-XXXX", "aliases": ["CVE-XXXX"], ...}}
       {"finding": {"osv": "GO-XXXX", "trace": [...]}}
 
     Returns:
-        found_osv_ids   – OSV IDs that appear in "finding" records
-        alias_map       – maps each OSV ID to its full set of aliases (incl. CVE IDs)
+        found_osv_ids  – OSV IDs that appear in "finding" records
+        alias_map      – maps each OSV ID to its full set of aliases (CVE IDs included)
+        go_version     – embedded Go toolchain version from the SBOM record (e.g. "1.26.4")
     """
     found_osv: set[str] = set()
     alias_map: dict[str, set[str]] = {}
+    go_version: str = ""
 
     decoder = json.JSONDecoder()
     pos = 0
@@ -193,12 +177,19 @@ def _parse_govulncheck_json(stdout: str) -> tuple[set[str], dict[str, set[str]]]
         try:
             obj, idx = decoder.raw_decode(stdout, pos)
             pos = idx
-            # Skip whitespace between objects
             while pos < len(stdout) and stdout[pos] in " \n\r\t":
                 pos += 1
         except json.JSONDecodeError:
             pos += 1
             continue
+
+        # SBOM record: contains the embedded Go toolchain version
+        sbom = obj.get("SBOM")
+        if isinstance(sbom, dict) and not go_version:
+            raw_ver = sbom.get("go_version", "")
+            m = re.search(r"(\d+\.\d+(?:\.\d+)?(?:-[^\s]+)?)", raw_ver)
+            if m:
+                go_version = m.group(1)
 
         # OSV record: canonical vulnerability definition with aliases
         osv_rec = obj.get("osv")
@@ -214,7 +205,7 @@ def _parse_govulncheck_json(stdout: str) -> tuple[set[str], dict[str, set[str]]]
             if osv_id:
                 found_osv.add(osv_id)
 
-    return found_osv, alias_map
+    return found_osv, alias_map, go_version
 
 
 def _expand_ids(osv_ids: set[str], alias_map: dict[str, set[str]]) -> set[str]:
@@ -225,38 +216,29 @@ def _expand_ids(osv_ids: set[str], alias_map: dict[str, set[str]]) -> set[str]:
     return expanded
 
 
-def _run_govulncheck(binary: Path) -> tuple[set[str], set[str]]:
+def _run_govulncheck(binary: Path) -> tuple[set[str], set[str], str]:
     """
     Run govulncheck in binary mode and return:
-        (confirmed_ids, confirmed_ids)   ← both sets are identical in binary mode
+        (confirmed_ids, confirmed_ids, go_version)
 
-    In binary mode govulncheck uses the binary's symbol table and call graph
-    (from DWARF debug info) to detect whether vulnerable symbols are present.
-    The `-show all` flag is not supported with JSON output, and in practice
-    binary mode already returns all reachable findings by default — testing
-    shows the default JSON output and `-show all` text output produce identical
-    counts.  Therefore we run a single JSON pass:
-        • CVE in findings → "confirmed" (vulnerable symbol detected in binary)
-        • CVE NOT in findings → "false_positive" (not present / fixed toolchain)
+    go_version comes from the SBOM JSON record emitted by govulncheck itself,
+    so no separate `go version <binary>` call is needed at runtime.
 
-    The "unexploitable" category (symbol present but call path unreachable) is
-    meaningful only in source mode; binary mode cannot make that distinction.
-
-    Returns (confirmed_ids, confirmed_ids) so callers that compare
-    reachable vs all get consistent behaviour without changing the call site.
+    In binary mode govulncheck detects whether vulnerable symbols are present.
+    There is no "unexploitable" distinction — any detected CVE is "confirmed".
     """
     try:
         r = subprocess.run(
             ["govulncheck", "-mode", "binary", "-json", str(binary)],
             capture_output=True, text=True, timeout=180,
         )
-        found_osv, alias_map = _parse_govulncheck_json(r.stdout)
+        found_osv, alias_map, go_version = _parse_govulncheck_json(r.stdout)
     except Exception as exc:
         logger.warning(f"govulncheck failed on {binary.name}: {exc}")
-        found_osv, alias_map = set(), {}
+        found_osv, alias_map, go_version = set(), {}, ""
 
     confirmed = _expand_ids(found_osv, alias_map)
-    return confirmed, confirmed  # both identical — no unexploitable in binary mode
+    return confirmed, confirmed, go_version
 
 
 # ── Per-target analysis ────────────────────────────────────────────────────────
@@ -278,10 +260,8 @@ def _analyze_target(
             result["skipped"].append(v)
         return
 
-    go_ver = _get_go_version(local_binary)
+    reachable_ids, all_ids, go_ver = _run_govulncheck(local_binary)
     logger.info(f"Analyzing {target} (Go {go_ver or 'unknown'}) with govulncheck …")
-
-    reachable_ids, all_ids = _run_govulncheck(local_binary)
     logger.debug(
         f"{target}: govulncheck reachable={len(reachable_ids)}, present={len(all_ids)}"
     )

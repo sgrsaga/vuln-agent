@@ -78,3 +78,19 @@ Always includes the release namespace so the agent never scans itself.
 {{- $ns = append $ns .Release.Namespace }}
 {{- $ns | uniq | join "," }}
 {{- end }}
+
+{{/*
+Target namespaces as a comma-separated string (whitelist).
+Strips the agent's own release namespace to prevent self-scanning.
+Returns empty string when targetNamespaces is not configured.
+*/}}
+{{- define "vuln-agent.targetNamespaces" -}}
+{{- $targets := .Values.discovery.targetNamespaces | default list }}
+{{- $filtered := list }}
+{{- range $targets }}
+  {{- if ne . $.Release.Namespace }}
+    {{- $filtered = append $filtered . }}
+  {{- end }}
+{{- end }}
+{{- $filtered | uniq | join "," }}
+{{- end }}

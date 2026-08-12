@@ -2,17 +2,19 @@
 Main agentic remediation loop.
 
 Per iteration:
-  1. Scan current image with Trivy       → save scan-iter-N.json
-  2. Generate Claude recovery report     → save report-iter-N.md
-  3. Ask Claude to patch the image       → save dockerfile-iter-N
-  4. Build + push to private registry    → new image tag
-  5. Rescan the new image                → compare CVE counts
-  6. Continue if improved; stop otherwise
+  1. Scan current image with Trivy              → save scan-iter-N.json
+  1b. govulncheck binary analysis (iter 1 only) → save go-analysis-iter-1.json
+  2. Generate Claude recovery report            → save report-iter-N.md
+  3. Ask Claude to patch the image              → save dockerfile-iter-N
+  4. Build patched image LOCALLY (no push yet)
+  5. Rescan locally built image                 → compare CVE counts
+  6. If improved: push to registry; else: skip push (keeps repo clean)
+  7. Continue if improved; stop otherwise
 
 Termination conditions (first one wins):
-  A. Zero HIGH/CRITICAL vulnerabilities remaining
+  A. Zero HIGH/CRITICAL effective vulnerabilities remaining
   B. Claude returns CANNOT_PATCH_FURTHER
-  C. New patch did not reduce the CVE count
+  C. Patched image showed no CVE reduction — not pushed
   D. MAX_ITERATIONS reached
 """
 
@@ -22,7 +24,7 @@ import os
 from .scanner import scan_image, extract_vulnerabilities
 from .reporter import generate_report
 from .patcher import generate_patch
-from .builder import build_and_push
+from .builder import build_image, push_image
 from .go_analyzer import analyze_go_vulns, summary_line as go_summary
 from . import publisher
 from .publisher import publish_scan, publish_report, publish_event, publish_go_analysis
@@ -177,18 +179,21 @@ def run(image_ref: str, create_release: bool = True) -> dict:
         publish_event("patch_generated",
             f"Dockerfile saved → {df_path.name} ({len(dockerfile.splitlines())} lines)")
 
-        # ── 4. Build + push ───────────────────────────────────────────────────
-        publish_event("build_start", f"Building patched image (iteration {iteration}) ...")
+        # ── 4. Build locally (push deferred until improvement confirmed) ──────
+        publish_event("build_start",
+            f"Building patched image locally (iteration {iteration}) — "
+            "will push only if CVEs improve ...")
         try:
-            new_image = build_and_push(dockerfile, current_image, iteration)
+            new_image = build_image(dockerfile, current_image, iteration)
         except Exception as exc:
             publish_event("error", f"Build failed: {exc}")
             return _done("build_error", current_image, iteration, len(effective_vulns), create_release)
 
-        publish_event("build_complete", f"Built and pushed: `{new_image}`", {"image": new_image})
+        publish_event("build_local",
+            f"Local build ready: `{new_image}` — rescanning before push ...")
 
-        # ── 5. Rescan ─────────────────────────────────────────────────────────
-        publish_event("scan_start", f"Rescanning patched image `{new_image}` ...")
+        # ── 5. Rescan locally built image ─────────────────────────────────────
+        publish_event("scan_start", f"Rescanning `{new_image}` ...")
         try:
             new_raw = scan_image(new_image)
         except Exception as exc:
@@ -196,18 +201,31 @@ def run(image_ref: str, create_release: bool = True) -> dict:
             break
 
         new_vulns = extract_vulnerabilities(new_raw)
-        # Compare using effective counts (false positives excluded) so that
-        # reclassified Trivy noise doesn't mask real improvements
+        # Compare using effective counts (false positives excluded)
         new_fp_ids = {v["id"] for v in (go_analysis or {}).get("false_positives", [])}
         new_effective = [v for v in new_vulns if v["id"] not in new_fp_ids]
         improvement = len(effective_vulns) - len(new_effective)
 
         if improvement <= 0:
             publish_event("no_improvement",
-                f"⚠️  Patch did not reduce effective vulnerabilities "
-                f"({len(effective_vulns)} → {len(new_effective)}). Stopping.",
+                f"⚠️  Patch gave no CVE reduction ({len(effective_vulns)} → {len(new_effective)}) — "
+                "skipping registry push to keep repo clean.",
                 {"before": len(effective_vulns), "after": len(new_effective)})
-            return _done("no_improvement", new_image, iteration, len(new_effective), create_release)
+            return _done("no_improvement", current_image, iteration, len(new_effective), create_release)
+
+        # ── 6. Push — only now that improvement is confirmed ──────────────────
+        publish_event("build_start",
+            f"CVEs reduced by {improvement} ({len(effective_vulns)} → {len(new_effective)}) — "
+            f"pushing `{new_image}` to registry ...")
+        try:
+            push_image(new_image)
+        except Exception as exc:
+            publish_event("error", f"Push failed: {exc}")
+            return _done("push_error", current_image, iteration, len(new_effective), create_release)
+
+        publish_event("build_complete",
+            f"✅ Pushed: `{new_image}` ({improvement} fewer CVEs)",
+            {"image": new_image, "improvement": improvement})
 
         publish_event("improvement",
             f"✅ Reduced by {improvement}: {len(effective_vulns)} → {len(new_effective)} effective CVEs",

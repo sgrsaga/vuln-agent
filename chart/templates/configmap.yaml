@@ -6,8 +6,12 @@ metadata:
   labels:
     {{- include "vuln-agent.labels" . | nindent 4 }}
 data:
-  # Namespaces skipped during image discovery.
-  # The release namespace is always appended automatically (see _helpers.tpl).
+  # Target namespaces (whitelist). When non-empty, ONLY these are scanned.
+  # The release namespace is stripped automatically.
+  TARGET_NAMESPACES: {{ include "vuln-agent.targetNamespaces" . | quote }}
+
+  # Excluded namespaces (blacklist). Used only when TARGET_NAMESPACES is empty.
+  # The release namespace is always appended automatically.
   EXCLUDED_NAMESPACES: {{ include "vuln-agent.excludedNamespaces" . | quote }}
 
   # Whether to scan images in init containers as well as regular containers.

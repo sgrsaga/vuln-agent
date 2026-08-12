@@ -1,3 +1,10 @@
+# ── Stage 0: Build govulncheck from the official Go Docker image ─────────────
+# Using the golang image avoids downloading Go from go.dev inside the build.
+# CGO_ENABLED=0 produces a fully static binary that runs on any glibc host.
+FROM golang:1.25 AS gotools
+RUN CGO_ENABLED=0 go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+
 # ── Stage 1: Python dependencies ────────────────────────────────────────────
 FROM python:3.12-slim AS deps
 
@@ -30,22 +37,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Go toolchain for `go version` (embedded version detection) and govulncheck
-# (call-graph analysis of Go binaries to distinguish false positives from real CVEs).
-# Using a build arg so the version can be pinned at image build time.
-ARG GOVERSION=1.24.4
-ENV GOPATH=/go
-ENV PATH="/usr/local/go/bin:/go/bin:${PATH}"
-RUN curl -fsSL "https://go.dev/dl/go${GOVERSION}.linux-amd64.tar.gz" \
-        | tar -C /usr/local -xz \
-    && go install golang.org/x/vuln/cmd/govulncheck@latest \
-    # Remove source cache but keep the compiled govulncheck binary
-    && rm -rf /go/pkg /root/.cache/go-build \
-    # Make /go/bin readable by all users (agent runs as non-root)
-    && chmod -R 755 /go/bin
 
 # Copy pre-built Python packages from deps stage
 COPY --from=deps /install /usr/local
+
+# Copy govulncheck static binary from gotools stage.
+# No Go toolchain needed at runtime — govulncheck's JSON output includes the
+# embedded Go version via the SBOM record, so `go version <binary>` is not used.
+COPY --from=gotools /go/bin/govulncheck /usr/local/bin/govulncheck
 
 # Copy application source
 WORKDIR /app

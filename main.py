@@ -5,11 +5,15 @@ vuln-agent — Agentic Docker image vulnerability remediator
 Single image:
     python main.py ghcr.io/dexidp/dex:v2.45.1
 
-Auto-discover all images in cluster (k8s mode):
-    python main.py --discover
+Auto-discover all images in targeted namespaces:
+    python main.py --discover --namespaces argocd,monitoring,staging
 
-Exclude namespaces from discovery:
-    python main.py --discover --exclude-namespaces kube-system,monitoring,logging
+Auto-discover all images cluster-wide (minus excluded):
+    python main.py --discover --exclude-namespaces kube-system,kube-public
+
+Push policy: patched images are pushed ONLY when a Trivy rescan confirms
+a net reduction in HIGH/CRITICAL CVEs.  If no improvement is detected the
+locally built image is discarded and nothing reaches the registry.
 """
 
 import argparse
@@ -92,21 +96,39 @@ def run_discovery(args) -> int:
     from agent.discoverer import discover_images
     from agent.orchestrator import run
 
-    # Build the exclusion list from all sources
-    excluded: list[str] = []
-    env_excluded = os.environ.get("EXCLUDED_NAMESPACES", "")
-    if env_excluded:
-        excluded.extend(ns.strip() for ns in env_excluded.split(",") if ns.strip())
-    if args.exclude_namespaces:
-        excluded.extend(ns.strip() for ns in args.exclude_namespaces.split(",") if ns.strip())
-    excluded = list(dict.fromkeys(excluded))  # deduplicate, preserve order
-
     include_init = os.environ.get("INCLUDE_INIT_CONTAINERS", "false").lower() == "true"
 
-    pub.publish_event("discover_start",
-        f"Discovering images (excluding: {', '.join(excluded) or 'none'})")
+    # Target namespaces (whitelist) — takes priority over excluded list
+    targets: list[str] = []
+    env_targets = os.environ.get("TARGET_NAMESPACES", "")
+    if env_targets:
+        targets.extend(ns.strip() for ns in env_targets.split(",") if ns.strip())
+    if getattr(args, "namespaces", None):
+        targets.extend(ns.strip() for ns in args.namespaces.split(",") if ns.strip())
+    targets = list(dict.fromkeys(targets))
 
-    images = discover_images(excluded, include_init)
+    # Excluded namespaces (blacklist) — used only when no target list given
+    excluded: list[str] = []
+    if not targets:
+        env_excluded = os.environ.get("EXCLUDED_NAMESPACES", "")
+        if env_excluded:
+            excluded.extend(ns.strip() for ns in env_excluded.split(",") if ns.strip())
+        if getattr(args, "exclude_namespaces", None):
+            excluded.extend(ns.strip() for ns in args.exclude_namespaces.split(",") if ns.strip())
+        excluded = list(dict.fromkeys(excluded))
+
+    if targets:
+        pub.publish_event("discover_start",
+            f"Discovering images in target namespaces: {', '.join(targets)}")
+    else:
+        pub.publish_event("discover_start",
+            f"Discovering images (excluding: {', '.join(excluded) or 'none'})")
+
+    images = discover_images(
+        excluded_namespaces=excluded,
+        include_init_containers=include_init,
+        target_namespaces=targets,
+    )
     if not images:
         logger.warning("No images discovered — nothing to scan")
         return 0
@@ -174,10 +196,16 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--namespaces",
+        metavar="NS1,NS2",
+        help="Comma-separated namespaces to scan (whitelist — overrides --exclude-namespaces). "
+             "Also reads TARGET_NAMESPACES env var."
+    )
+    parser.add_argument(
         "--exclude-namespaces",
         metavar="NS1,NS2",
-        help="Comma-separated namespaces to skip during discovery "
-             "(also reads EXCLUDED_NAMESPACES env var)"
+        help="Comma-separated namespaces to skip (blacklist, used when --namespaces is absent). "
+             "Also reads EXCLUDED_NAMESPACES env var."
     )
     parser.add_argument(
         "--max-iterations", type=int,
@@ -200,6 +228,12 @@ def main() -> int:
 
     if args.discover:
         logger.info("Mode         : cluster discovery")
+        if getattr(args, "namespaces", None) or os.environ.get("TARGET_NAMESPACES"):
+            ns = args.namespaces or os.environ.get("TARGET_NAMESPACES", "")
+            logger.info(f"Target ns    : {ns}")
+        elif getattr(args, "exclude_namespaces", None) or os.environ.get("EXCLUDED_NAMESPACES"):
+            ex = args.exclude_namespaces or os.environ.get("EXCLUDED_NAMESPACES", "")
+            logger.info(f"Exclude ns   : {ex}")
         logger.info(f"Max iter/image: {args.max_iterations}")
         logger.info(f"Output dir   : {args.output_dir}/")
         if os.environ.get("GHCR_NAMESPACE"):
