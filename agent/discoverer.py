@@ -121,3 +121,96 @@ def _is_digest_only(image: str) -> bool:
     """Skip bare sha256 digest references — they have no tag to patch against."""
     name = image.split("/")[-1]
     return "@sha256:" in name and ":" not in name.split("@")[0]
+
+
+# Annotation keys a Deployment can set (on its pod template, which propagates to
+# the actual pods) to self-service hardening config — no need to centrally
+# maintain HARDENING_CONFIG for every owned app. Values here win over a matching
+# HARDENING_CONFIG entry when both are present (see main.py: _maybe_harden()).
+_ANNOTATION_PREFIX = "vuln-agent.io/"
+_ANNOTATION_KEYS = {
+    "source-repo": "sourceRepo",
+    "dockerfile-path": "dockerfilePath",
+    "test-stage": "testStage",
+    "test-command": "testCommand",
+}
+
+
+def _extract_hardening_annotations(annotations: dict | None) -> dict:
+    if not annotations:
+        return {}
+    cfg = {}
+    for suffix, key in _ANNOTATION_KEYS.items():
+        val = annotations.get(f"{_ANNOTATION_PREFIX}{suffix}")
+        if val:
+            cfg[key] = val
+    return cfg
+
+
+def discover_owned_images(label_selector: str) -> dict[str, dict]:
+    """
+    Return {image_ref: hardening_config} for pods matching label_selector,
+    cluster-wide — no namespace filtering here; callers intersect the result
+    with an already-namespace-filtered discover_images() list, so ownership
+    can never bypass the existing namespace whitelist/blacklist.
+
+    hardening_config holds whatever vuln-agent.io/* hardening annotations were
+    present on that pod (possibly empty — a HARDENING_CONFIG entry can supply
+    the rest, or the image simply isn't fully configured yet). When the same
+    image appears on multiple pods, the first one found wins — real Deployments
+    are internally consistent, so this is only a concern for a mid-rollout or
+    misconfigured cluster.
+
+    Used to mark which images are eligible for base-image hardening (only ever
+    attempted on images the org owns and can test — never third-party images).
+    """
+    try:
+        return _owned_via_client(label_selector)
+    except ImportError:
+        logger.warning("kubernetes Python client not installed — falling back to kubectl")
+        return _owned_via_kubectl(label_selector)
+
+
+def _owned_via_client(label_selector: str) -> dict[str, dict]:
+    from kubernetes import client, config  # noqa: PLC0415
+
+    try:
+        config.load_incluster_config()
+    except Exception:
+        config.load_kube_config()
+
+    v1 = client.CoreV1Api()
+    pods = v1.list_pod_for_all_namespaces(watch=False, label_selector=label_selector)
+
+    images: dict[str, dict] = {}
+    for pod in pods.items:
+        cfg = _extract_hardening_annotations(pod.metadata.annotations)
+        for c in pod.spec.containers or []:
+            if c.image and not _is_digest_only(c.image):
+                images.setdefault(c.image, cfg)
+
+    logger.info(f"Discovered {len(images)} owned image(s) matching label selector {label_selector!r}")
+    return images
+
+
+def _owned_via_kubectl(label_selector: str) -> dict[str, dict]:
+    result = subprocess.run(
+        ["kubectl", "get", "pods", "--all-namespaces", "-l", label_selector, "-o", "json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"kubectl get pods -l {label_selector} failed:\n{result.stderr}")
+
+    data = json.loads(result.stdout)
+    images: dict[str, dict] = {}
+    for pod in data.get("items", []):
+        cfg = _extract_hardening_annotations(pod.get("metadata", {}).get("annotations"))
+        for c in pod.get("spec", {}).get("containers", []):
+            img = c.get("image", "")
+            if img and not _is_digest_only(img):
+                images.setdefault(img, cfg)
+
+    logger.info(f"Discovered {len(images)} owned image(s) matching label selector {label_selector!r} via kubectl")
+    return images

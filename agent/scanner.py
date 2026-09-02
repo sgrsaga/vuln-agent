@@ -26,6 +26,12 @@ def scan_image(image_ref: str) -> dict:
     return json.loads(result.stdout)
 
 
+def extract_os_info(scan_data: dict) -> dict:
+    """Pull the base OS family/version Trivy detected, e.g. {'family': 'debian', 'version': '11.3'}."""
+    os_meta = (scan_data.get("Metadata") or {}).get("OS") or {}
+    return {"family": os_meta.get("Family", ""), "version": os_meta.get("Name", "")}
+
+
 def extract_vulnerabilities(scan_data: dict) -> list[dict]:
     """Flatten Trivy JSON into a normalised list of CVE dicts."""
     vulns = []

@@ -12,123 +12,159 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
-def generate_report(
-    image_ref: str,
-    iteration: int,
-    vulnerabilities: list[dict],
-    go_analysis: dict | None = None,
-) -> str:
-    """Generate a detailed Markdown remediation report using Claude Opus 4.8."""
-    if not vulnerabilities:
-        return (
-            f"# Remediation Report — Iteration {iteration}\n\n"
-            "✅ **No HIGH or CRITICAL vulnerabilities found.** The image is clean."
+def _fmt_table(vulns: list[dict]) -> str:
+    rows = []
+    for v in sorted(vulns, key=lambda x: (x["severity"] != "CRITICAL", x["id"])):
+        fix = v.get("fixed") or "NO FIX"
+        rows.append(
+            f"| {v['severity']} | `{v['id']}` | `{v['package']}` "
+            f"| {v['installed']} | {fix} | {v['title'][:60]} |"
         )
+    return (
+        "| Severity | CVE ID | Package | Installed | Fix Version | Title |\n"
+        "|----------|--------|---------|-----------|-------------|-------|\n"
+    ) + ("\n".join(rows) if rows else "_(none)_")
 
-    crit = sum(1 for v in vulnerabilities if v["severity"] == "CRITICAL")
-    high = sum(1 for v in vulnerabilities if v["severity"] == "HIGH")
 
-    os_vulns = [v for v in vulnerabilities if v["type"] in ("alpine", "debian", "ubuntu", "redhat", "centos")]
-    binary_vulns = [v for v in vulnerabilities if v["type"] == "gobinary"]
-    other_vulns = [v for v in vulnerabilities if v not in os_vulns and v not in binary_vulns]
+def _govuln_section(go_analysis: dict | None) -> str:
+    if not go_analysis:
+        return ""
 
-    def fmt_table(vulns: list[dict]) -> str:
-        rows = []
-        for v in sorted(vulns, key=lambda x: (x["severity"] != "CRITICAL", x["id"])):
-            fix = v.get("fixed") or "NO FIX"
-            rows.append(
-                f"| {v['severity']} | `{v['id']}` | `{v['package']}` "
-                f"| {v['installed']} | {fix} | {v['title'][:60]} |"
-            )
-        return (
-            "| Severity | CVE ID | Package | Installed | Fix Version | Title |\n"
-            "|----------|--------|---------|-----------|-------------|-------|\n"
-        ) + "\n".join(rows)
+    fp = go_analysis.get("false_positives", [])
+    un = go_analysis.get("unexploitable", [])
+    co = go_analysis.get("confirmed", [])
+    sk = go_analysis.get("skipped", [])
 
-    sections = [f"## OS / Package Vulnerabilities ({len(os_vulns)})\n\n{fmt_table(os_vulns)}" if os_vulns else ""]
-    if binary_vulns:
-        sections.append(f"## Go Binary Vulnerabilities ({len(binary_vulns)})\n\n{fmt_table(binary_vulns)}")
-    if other_vulns:
-        sections.append(f"## Other Vulnerabilities ({len(other_vulns)})\n\n{fmt_table(other_vulns)}")
+    def _table(vulns: list[dict]) -> str:
+        rows = [
+            f"| `{v['id']}` | `{v['package']}` | {v['severity']} "
+            f"| {v.get('analysis', {}).get('go_version', '?')} "
+            f"| {v.get('analysis', {}).get('reason', '')[:120]} |"
+            for v in sorted(vulns, key=lambda x: x["id"])
+        ]
+        hdr = (
+            "| CVE ID | Package | Severity | Go Version | govulncheck finding |\n"
+            "|--------|---------|----------|------------|---------------------|\n"
+        )
+        return hdr + "\n".join(rows) if rows else "_(none)_"
 
-    # Build govulncheck analysis section if available
-    go_analysis_section = ""
-    if go_analysis:
-        fp  = go_analysis.get("false_positives", [])
-        un  = go_analysis.get("unexploitable", [])
-        co  = go_analysis.get("confirmed", [])
-        sk  = go_analysis.get("skipped", [])
-
-        def _govuln_table(vulns: list[dict]) -> str:
-            rows = [
-                f"| `{v['id']}` | `{v['package']}` | {v['severity']} "
-                f"| {v.get('analysis', {}).get('go_version', '?')} "
-                f"| {v.get('analysis', {}).get('reason', '')[:120]} |"
-                for v in sorted(vulns, key=lambda x: x["id"])
-            ]
-            hdr = (
-                "| CVE ID | Package | Severity | Go Version | govulncheck finding |\n"
-                "|--------|---------|----------|------------|---------------------|\n"
-            )
-            return hdr + "\n".join(rows) if rows else "_(none)_"
-
-        go_analysis_section = f"""
+    return f"""
 ## govulncheck Binary Analysis Results
 
-govulncheck performed call-graph analysis on each Go binary in this image.
+govulncheck performed call-graph analysis on each Go binary in the original image.
 This is more precise than Trivy's version-based matching.
 
 ### False Positives ({len(fp)}) — suppress in scanner policy
 These CVEs do NOT exist in the binary as compiled. The binary was built with a
 Go toolchain or dependency version that already contains the fix.
 
-{_govuln_table(fp)}
+{_table(fp)}
 
 ### Unexploitable ({len(un)}) — risk-accept, monitor upstream
 These CVEs are present in the binary but the vulnerable symbol is **not reachable**
 from any entry point in the call graph. Not exploitable in practice.
 
-{_govuln_table(un)}
+{_table(un)}
 
 ### Confirmed ({len(co)}) — requires source rebuild
 These CVEs are **genuinely exploitable**: the vulnerable symbol is reachable.
 They cannot be fixed at the image layer; a source rebuild with patched dependencies is required.
 
-{_govuln_table(co)}
-{"### Skipped (" + str(len(sk)) + ") — binary not extractable" + chr(10) + _govuln_table(sk) if sk else ""}
+{_table(co)}
+{"### Skipped (" + str(len(sk)) + ") — binary not extractable" + chr(10) + _table(sk) if sk else ""}
 """
 
-    effective_count = len(vulnerabilities) - len(go_analysis.get("false_positives", []) if go_analysis else [])
 
-    prompt = f"""You are a senior container security engineer. Analyse this Trivy vulnerability report for image `{image_ref}` (remediation pass #{iteration}) and write a comprehensive Markdown remediation report.
+def generate_summary_report(
+    image_ref: str,
+    final_image: str,
+    status: str,
+    iterations: int,
+    baseline_vulns: list[dict],
+    final_vulns: list[dict],
+    go_analysis: dict | None = None,
+    unbuilt_dockerfile: str | None = None,
+) -> str:
+    """
+    Generate one before/after Markdown remediation summary using Claude Opus 4.8,
+    covering the whole run rather than a single iteration.
+    """
+    if not baseline_vulns:
+        return (
+            "# Remediation Summary\n\n"
+            f"✅ **`{image_ref}` was already clean** — no HIGH or CRITICAL "
+            "vulnerabilities found on the first scan. No changes were made."
+        )
 
-## Scan Summary
-- Raw total: {len(vulnerabilities)} (CRITICAL: {crit}, HIGH: {high})
-- Effective (excluding govulncheck false positives): {effective_count}
-- Scan iteration: {iteration}
+    baseline_ids = {v["id"] for v in baseline_vulns}
+    final_ids = {v["id"] for v in final_vulns}
+    resolved = [v for v in baseline_vulns if v["id"] not in final_ids]
+    still_present = [v for v in final_vulns if v["id"] in baseline_ids]
+    newly_introduced = [v for v in final_vulns if v["id"] not in baseline_ids]
 
-{chr(10).join(s for s in sections if s)}
-{go_analysis_section}
+    b_crit = sum(1 for v in baseline_vulns if v["severity"] == "CRITICAL")
+    b_high = sum(1 for v in baseline_vulns if v["severity"] == "HIGH")
+    f_crit = sum(1 for v in final_vulns if v["severity"] == "CRITICAL")
+    f_high = sum(1 for v in final_vulns if v["severity"] == "HIGH")
+
+    fp_ids = {v["id"] for v in (go_analysis or {}).get("false_positives", [])}
+    effective_baseline = len([v for v in baseline_vulns if v["id"] not in fp_ids])
+    effective_final = len([v for v in final_vulns if v["id"] not in fp_ids])
+
+    dockerfile_section = ""
+    if unbuilt_dockerfile:
+        dockerfile_section = f"""
+## Generated but unverified patch
+
+A patch Dockerfile was generated but could not be built/verified in this run
+(no Docker daemon available). Use it as the starting point for a manual build:
+
+```dockerfile
+{unbuilt_dockerfile}
+```
+"""
+
+    prompt = f"""You are a senior container security engineer. Write a comprehensive Markdown
+before/after remediation summary for a multi-iteration automated remediation run.
+
+## Run outcome
+- Original image: `{image_ref}`
+- Final image: `{final_image}`
+- Status: `{status}`
+- Iterations run: {iterations}
+
+## Before (first scan)
+- Raw total: {len(baseline_vulns)} (CRITICAL: {b_crit}, HIGH: {b_high})
+- Effective (excluding govulncheck false positives): {effective_baseline}
+
+{_fmt_table(baseline_vulns)}
+
+## After (final state)
+- Raw total: {len(final_vulns)} (CRITICAL: {f_crit}, HIGH: {f_high})
+- Effective (excluding govulncheck false positives): {effective_final}
+
+{_fmt_table(final_vulns)}
+
+## Diff
+- Resolved ({len(resolved)}): {", ".join(v["id"] for v in resolved) or "(none)"}
+- Still present ({len(still_present)}): {", ".join(v["id"] for v in still_present) or "(none)"}
+- Newly introduced ({len(newly_introduced)}): {", ".join(v["id"] for v in newly_introduced) or "(none)"}
+{_govuln_section(go_analysis)}
+{dockerfile_section}
 
 ## Required report sections
 
-1. **Executive Summary** — overall risk rating (Critical/High/Medium), one-paragraph assessment.
-   If govulncheck analysis is available, lead with the EFFECTIVE risk (excluding false positives)
-   and explain that raw Trivy counts include noise.
+1. **Executive Summary** — overall risk rating before and after (Critical/High/Medium),
+   one-paragraph assessment of the improvement achieved and what remains.
 
-2. **Attack Surface Breakdown** — separate analysis for:
-   - Alpine/OS packages (fixable with `apk upgrade` or pinned versions)
-   - Go binary CVEs — broken into three sub-categories based on govulncheck analysis:
-     a) **False positives** — describe what they are, recommend scanner suppression
-     b) **Unexploitable** — describe why they are low-risk, recommend risk-acceptance template
-     c) **Confirmed** — describe genuine risk, recommend source rebuild path
-   - If NO govulncheck analysis is provided: note that Go binary CVEs cannot be patched at
-     the image layer and require source rebuild; suggest running govulncheck for precise analysis
+2. **What changed** — plain-language account of how the reduction was achieved
+   (base image tag bump, OS package upgrade, or both), and how many iterations it took.
 
-3. **Prioritised Remediation Steps**
-   - For each fixable OS CVE: exact Dockerfile snippet or shell command
-   - For confirmed Go binary CVEs: source rebuild guidance (upgrade Go toolchain version, rebuild image from source)
-   - For false positives: scanner suppression guidance (trivy.yaml ignore rules)
+3. **Remaining Risk Breakdown** — for everything still present after remediation:
+   - Alpine/OS packages with no fix available
+   - Go binary CVEs, broken into false positives / unexploitable / confirmed
+     (per the govulncheck section above, if present)
+   - Anything else still open, with remediation guidance for each
 
 4. **Risk Acceptance Template** — for unexploitable Go CVEs, a copy-paste risk acceptance entry:
    ```
@@ -143,12 +179,9 @@ They cannot be fixed at the image layer; a source rebuild with patched dependenc
 5. **Residual Risk Guidance** — compensating controls for confirmed Go binary CVEs:
    network policies, mTLS enforcement, read-only filesystem, seccomp/AppArmor profiles
 
-6. **Estimated CVE Reduction** — if recommended patches are applied, how many CVEs are
-   expected to be resolved vs remain
-
 Be precise, technical, and actionable. Use Markdown headers, code blocks, and tables."""
 
-    logger.info(f"Generating remediation report (iteration {iteration})...")
+    logger.info(f"Generating summary report ({iterations} iteration(s))...")
     client = _get_client()
     with client.messages.stream(
         model="claude-opus-4-8",

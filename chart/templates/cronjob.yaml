@@ -32,7 +32,7 @@ spec:
           # ── Init container: refresh Trivy vulnerability DB ────────────────
           initContainers:
             - name: trivy-db-update
-              image: aquasec/trivy:latest
+              image: {{ .Values.trivy.image }}
               args: ["image", "--download-db-only", "--cache-dir", "/trivy-cache"]
               volumeMounts:
                 - name: trivy-cache
@@ -40,7 +40,7 @@ spec:
 
           containers:
             - name: vuln-agent
-              image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag }}
+              image: {{ include "vuln-agent.image" . }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
 
               # Discovery mode — whitelist if targetNamespaces is set.
@@ -65,12 +65,21 @@ spec:
                     secretKeyRef:
                       name: {{ .Values.anthropic.existingSecret | default (include "vuln-agent.secretName" .) }}
                       key: {{ .Values.anthropic.existingSecretKey }}
+                      optional: true
 
                 - name: GITHUB_TOKEN
                   valueFrom:
                     secretKeyRef:
                       name: {{ .Values.github.existingSecret | default (include "vuln-agent.secretName" .) }}
                       key: {{ .Values.github.existingSecretKey }}
+                      optional: true
+
+                - name: GITOPS_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.gitops.existingSecret | default (include "vuln-agent.secretName" .) }}
+                      key: {{ .Values.gitops.existingSecretKey }}
+                      optional: true
 
                 {{- with .Values.extraEnv }}
                 {{- toYaml . | nindent 16 }}
@@ -86,6 +95,11 @@ spec:
                 - name: trivy-cache
                   mountPath: /trivy-cache
 
+                {{- if .Values.docker.hostSocketPath }}
+                - name: docker-socket
+                  mountPath: /var/run/docker.sock
+                {{- end }}
+
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
 
@@ -98,6 +112,13 @@ spec:
             - name: trivy-cache
               persistentVolumeClaim:
                 claimName: {{ printf "%s-trivy-cache" (include "vuln-agent.fullname" .) }}
+
+            {{- if .Values.docker.hostSocketPath }}
+            - name: docker-socket
+              hostPath:
+                path: {{ .Values.docker.hostSocketPath }}
+                type: Socket
+            {{- end }}
 
           {{- with .Values.nodeSelector }}
           nodeSelector:

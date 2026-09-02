@@ -103,9 +103,11 @@ jobs:
           **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           ### Attached artifacts
-          - `scan-iter-N.json` — Trivy JSON output for each iteration
-          - `report-iter-N.md` — Claude Opus 4.8 remediation report for each iteration
-          - `dockerfile-iter-N` — Generated patch Dockerfile for each iteration
+          - `scan-baseline.json` — Trivy JSON from the first scan, before any changes
+          - `summary-report.md` — Claude Opus 4.8 before/after remediation summary
+
+          The final image (if any changes were made) is tagged `<original-tag>-optimized`
+          in the registry — see the summary report for its exact reference.
 
           See the [Actions run summary](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for the full step-by-step log.
           EOF

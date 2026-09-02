@@ -22,6 +22,8 @@ from pathlib import Path
 
 import httpx
 
+from .image_tracker import STATE_DIR_NAME
+
 logger = logging.getLogger(__name__)
 
 # ── Mutable output directory (call set_output_dir() before each image run) ──
@@ -72,6 +74,9 @@ def _log(event_type: str, message: str, data: dict | None = None) -> None:
         "error":             "❌",
         "discover_start":    "🔎",
         "discover_complete": "🔎",
+        "tag_bump_found":    "🏷️",
+        "tag_bump":          "🏷️",
+        "tag_bump_unavailable": "🏷️",
     }
     icon = icons.get(event_type, "ℹ️")
     print(f"{icon}  [{event_type}] {message}", flush=True)
@@ -92,10 +97,10 @@ def _normalize_repo(repo: str) -> str:
 
 def publish_scan(
     image_ref: str,
-    iteration: int,
     scan_target: str,
     vulnerabilities: list[dict],
 ) -> None:
+    """Persist the baseline (first) scan only — called once per image, not per iteration."""
     out = get_output_dir()
     out.mkdir(parents=True, exist_ok=True)
     crit = sum(1 for v in vulnerabilities if v["severity"] == "CRITICAL")
@@ -104,17 +109,16 @@ def publish_scan(
     data = {
         "image_ref": image_ref,
         "scan_target": scan_target,
-        "iteration": iteration,
         "vulnerabilities": vulnerabilities,
         "critical_count": crit,
         "high_count": high,
         "timestamp": _now(),
     }
-    path = out / f"scan-iter-{iteration}.json"
+    path = out / "scan-baseline.json"
     path.write_text(json.dumps(data, indent=2))
-    logger.info(f"Scan saved → {path}")
+    logger.info(f"Baseline scan saved → {path}")
 
-    _md(f"\n### 🔍 Scan — Iteration {iteration} (`{scan_target}`)\n")
+    _md(f"\n### 🔍 Baseline Scan (`{scan_target}`)\n")
     _md(f"| Severity | Count |\n|----------|-------|\n"
         f"| CRITICAL | {crit} |\n| HIGH | {high} |\n| Total | {len(vulnerabilities)} |\n")
     if vulnerabilities:
@@ -125,16 +129,19 @@ def publish_scan(
             _md(f"| **{v['severity']}** | `{v['id']}` | `{v['package']}` | {v['installed']} | {fix} |")
 
 
-def publish_report(image_ref: str, iteration: int, content: str) -> None:
+def publish_summary(image_ref: str, final_image: str, status: str, content: str) -> None:
+    """Persist the one before/after summary report for the whole run."""
     out = get_output_dir()
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"report-iter-{iteration}.md"
+    path = out / "summary-report.md"
     path.write_text(
-        f"# Remediation Report — Iteration {iteration}\n\n"
-        f"> Image: `{image_ref}`\n\n{content}"
+        f"# Remediation Summary\n\n"
+        f"> Original image: `{image_ref}`\n"
+        f"> Final image: `{final_image}`\n"
+        f"> Status: `{status}`\n\n{content}"
     )
-    logger.info(f"Report saved → {path}")
-    _md(f"\n<details><summary>📋 Recovery Report — Iteration {iteration}</summary>\n\n{content}\n\n</details>\n")
+    logger.info(f"Summary report saved → {path}")
+    _md(f"\n<details><summary>📋 Remediation Summary</summary>\n\n{content}\n\n</details>\n")
 
 
 def publish_event(event_type: str, message: str, data: dict | None = None) -> None:
@@ -143,36 +150,17 @@ def publish_event(event_type: str, message: str, data: dict | None = None) -> No
 
 
 def publish_go_analysis(image_ref: str, iteration: int, go_analysis: dict) -> None:
-    """Save govulncheck classification results to go-analysis-iter-N.json."""
-    out = get_output_dir()
-    out.mkdir(parents=True, exist_ok=True)
-
-    # Strip heavy fields before serialising (analysis key is already on each vuln)
-    def _slim(vulns: list[dict]) -> list[dict]:
-        keep = ("id", "severity", "package", "installed", "fixed", "target", "analysis")
-        return [{k: v[k] for k in keep if k in v} for v in vulns]
-
-    data = {
-        "image_ref": image_ref,
-        "iteration": iteration,
-        "timestamp": _now(),
-        "summary": {
-            "false_positives": len(go_analysis.get("false_positives", [])),
-            "unexploitable": len(go_analysis.get("unexploitable", [])),
-            "confirmed": len(go_analysis.get("confirmed", [])),
-            "skipped": len(go_analysis.get("skipped", [])),
-        },
-        "false_positives": _slim(go_analysis.get("false_positives", [])),
-        "unexploitable": _slim(go_analysis.get("unexploitable", [])),
-        "confirmed": _slim(go_analysis.get("confirmed", [])),
-        "skipped": _slim(go_analysis.get("skipped", [])),
+    """
+    Log govulncheck classification results to the live GitHub Step Summary.
+    Not persisted as a standalone artifact — this content is folded into the
+    one final summary-report.md instead (see reporter.generate_summary_report).
+    """
+    s = {
+        "false_positives": len(go_analysis.get("false_positives", [])),
+        "unexploitable": len(go_analysis.get("unexploitable", [])),
+        "confirmed": len(go_analysis.get("confirmed", [])),
+        "skipped": len(go_analysis.get("skipped", [])),
     }
-    path = out / f"go-analysis-iter-{iteration}.json"
-    path.write_text(json.dumps(data, indent=2))
-    logger.info(f"Go analysis saved → {path}")
-
-    # Append summary to GitHub Step Summary
-    s = data["summary"]
     _md(f"\n### 🔬 Go Binary Analysis — Iteration {iteration}\n")
     _md(
         f"| Classification | Count | Meaning |\n"
@@ -209,7 +197,10 @@ def create_github_release(base_dir: Path | None = None, tag: str | None = None) 
         return
 
     search_root = base_dir or get_output_dir()
-    files = [f for f in search_root.rglob("*") if f.is_file()]
+    files = [
+        f for f in search_root.rglob("*")
+        if f.is_file() and STATE_DIR_NAME not in f.parts
+    ]
     if not files:
         logger.info("No output files found — skipping GitHub Release")
         return
@@ -234,9 +225,10 @@ def create_github_release(base_dir: Path | None = None, tag: str | None = None) 
                 "body": (
                     "## Automated vulnerability remediation results\n\n"
                     "### Attached artifacts\n"
-                    "- `<image>--scan-iter-N.json` — Trivy JSON per iteration\n"
-                    "- `<image>--report-iter-N.md` — Claude Opus 4.8 report per iteration\n"
-                    "- `<image>--dockerfile-iter-N` — Applied patch Dockerfile\n"
+                    "- `<image>--scan-baseline.json` — Trivy JSON from the first scan, before any changes\n"
+                    "- `<image>--summary-report.md` — Claude Opus 4.8 before/after remediation summary\n\n"
+                    "The final image (if any changes were made) is tagged `<original-tag>-optimized` "
+                    "in the registry — see the summary report for its exact reference.\n"
                 ),
                 "draft": False,
                 "prerelease": True,

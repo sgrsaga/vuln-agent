@@ -26,9 +26,11 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 FROM python:3.12-slim
 
 # Install Trivy (vulnerability scanner) and Docker CLI (to build/push images).
+# git is required only for base-image hardening (agent/hardener.py), which
+# clones an owned app's source repo to rebuild it against a candidate base.
 # The Docker *daemon* is NOT included — mount the host socket at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates \
+        curl ca-certificates git \
     && \
     # Trivy
     curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \

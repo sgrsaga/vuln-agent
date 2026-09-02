@@ -20,11 +20,29 @@ data:
   # Max remediation iterations per image before giving up.
   MAX_ITERATIONS: {{ .Values.scan.maxIterations | toString | quote }}
 
+  # Discovery mode: rescan an unchanged image again after this many days.
+  RESCAN_INTERVAL_DAYS: {{ .Values.scan.rescanIntervalDays | toString | quote }}
+
+  # Allow the tag-bump check to cross a major upstream version.
+  ALLOW_MAJOR_TAG_BUMP: {{ .Values.scan.allowMajorTagBump | toString | quote }}
+
+  # Base image hardening — only ever attempted for images matching this label
+  # selector, with a matching entry in HARDENING_CONFIG. Empty selector or
+  # empty config disables the feature entirely.
+  OWNED_IMAGE_LABEL_SELECTOR: {{ .Values.discovery.ownedImageLabelSelector | quote }}
+  HARDENING_CONFIG: {{ .Values.hardening.images | toJson | quote }}
+  HARDENING_MAX_CANDIDATES: {{ .Values.hardening.maxCandidates | toString | quote }}
+
   # Private registry namespace for pushed patched images.
   GHCR_NAMESPACE: {{ .Values.registry.namespace | quote }}
 
   # GitHub repo for Release artifact publishing (owner/repo format).
   GITHUB_REPO: {{ .Values.github.repo | quote }}
+
+  # GitOps promotion PR-bot (higher environments). Empty repo disables it.
+  GITOPS_REPO: {{ .Values.gitops.repo | quote }}
+  GITOPS_BASE_BRANCH: {{ .Values.gitops.baseBranch | quote }}
+  GITOPS_IMAGE_PATH_TEMPLATE: {{ .Values.gitops.imagePathTemplate | quote }}
 
   # Fixed paths inside the pod.
   OUTPUT_DIR: "/app/output"

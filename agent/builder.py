@@ -88,6 +88,51 @@ def build_image(dockerfile_content: str, source_image: str, iteration: int) -> s
     return new_ref
 
 
+def build_from_context(context_dir: str, tag: str, target: str | None = None, timeout: int = 900) -> None:
+    """
+    Build a Docker image from a real build context directory (e.g. a cloned repo),
+    optionally targeting one stage of a multi-stage Dockerfile — used by
+    agent/hardener.py to validate a candidate base image, and to run a
+    Dockerfile's own `test` stage as the pass/fail signal.
+
+    Raises RuntimeError on build (or, when target is a test stage, test) failure —
+    callers use "did this raise" as the pass/fail signal, no separate check needed.
+    """
+    cmd = ["docker", "build", "-t", tag]
+    if target:
+        cmd += ["--target", target]
+    cmd.append(context_dir)
+
+    logger.info(f"Building {tag} from {context_dir}" + (f" (target: {target})" if target else "") + " …")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"docker build failed (target={target}):\n"
+            f"--- stdout ---\n{result.stdout[-1500:]}\n"
+            f"--- stderr ---\n{result.stderr[-1500:]}"
+        )
+    logger.info(f"Build OK: {tag}")
+
+
+def run_isolated(image_ref: str, command: str, timeout: int = 600) -> int:
+    """
+    Run a command inside image_ref with no network access (`--network none`) and
+    return its exit code. Used to run a test suite from a cloned, untrusted
+    source repo without exposing the agent's mounted credentials to a network a
+    compromised/malicious test could reach — not full sandboxing (still shares
+    the docker daemon/host kernel), but a cheap, meaningful mitigation.
+    """
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", image_ref, "sh", "-c", command],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.stdout:
+        logger.debug(f"test output (stdout):\n{result.stdout[-2000:]}")
+    if result.stderr:
+        logger.debug(f"test output (stderr):\n{result.stderr[-2000:]}")
+    return result.returncode
+
+
 def push_image(image_ref: str) -> None:
     """
     Push a locally built image to GHCR.
@@ -109,6 +154,47 @@ def push_image(image_ref: str) -> None:
             f"docker push failed for {image_ref}:\n{result.stderr[-1500:]}"
         )
     logger.info(f"Pushed: {image_ref}")
+
+
+def tag_local_image(src_ref: str, dest_ref: str) -> None:
+    """
+    Retag a locally built Docker image under a new name — `docker tag`, no daemon
+    round-trip to a registry. Used to promote the last local build to its final
+    `<original-tag>-optimized` name before push_image() sends it out.
+    """
+    logger.info(f"Tagging {src_ref} -> {dest_ref} ...")
+    result = subprocess.run(
+        ["docker", "tag", src_ref, dest_ref],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"docker tag failed: {src_ref} -> {dest_ref}\n{result.stderr[-1500:]}"
+        )
+    logger.info(f"Tagged: {dest_ref}")
+
+
+def copy_image(src_ref: str, dest_ref: str) -> None:
+    """
+    Registry-to-registry copy via crane — no Docker daemon required.
+
+    Used to promote an upstream tag-bump candidate into GHCR_NAMESPACE without
+    a local pull/push round-trip.
+    """
+    logger.info(f"Copying {src_ref} -> {dest_ref} ...")
+    result = subprocess.run(
+        ["crane", "copy", src_ref, dest_ref],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"crane copy failed: {src_ref} -> {dest_ref}\n{result.stderr[-1500:]}"
+        )
+    logger.info(f"Copied: {dest_ref}")
 
 
 def build_and_push(dockerfile_content: str, source_image: str, iteration: int) -> str:

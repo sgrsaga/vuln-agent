@@ -52,6 +52,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Full agent image reference: digest takes precedence over tag for reproducibility.
+*/}}
+{{- define "vuln-agent.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository .Values.image.tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Name of the Opaque secret holding API keys.
 */}}
 {{- define "vuln-agent.secretName" -}}

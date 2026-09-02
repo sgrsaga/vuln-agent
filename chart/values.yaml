@@ -1,15 +1,17 @@
 # ── Agent container image ──────────────────────────────────────────────────
 image:
   repository: ghcr.io/sgrsaga/vuln-agent
-  tag: latest
-  pullPolicy: Always
+  tag: ""
+  digest: "sha256:1cfc906c15c0e0edf5276f8720413e986d3a1618eaebdb516f94fe6020f870c4"
+  pullPolicy: IfNotPresent
 
 # ── Anthropic API credentials ─────────────────────────────────────────────
+# Credentials are managed via SealedSecrets (chart/sealed-secrets.yaml).
+# Apply them before deploying:
+#   kubectl apply -f chart/sealed-secrets.yaml
 anthropic:
-  # Set the key inline (a Secret is created from this value)
   apiKey: ""
-  # -- OR -- reference an existing Secret (apiKey above is ignored if set)
-  existingSecret: ""
+  existingSecret: "vuln-agent-secrets"
   existingSecretKey: "anthropic-api-key"
 
 # ── GitHub credentials ────────────────────────────────────────────────────
@@ -17,23 +19,29 @@ anthropic:
 # Required scopes: repo + write:packages
 github:
   token: ""
-  existingSecret: ""
+  existingSecret: "vuln-agent-secrets"
   existingSecretKey: "github-token"
-  # Repository for GitHub Release artifacts (owner/repo format)
-  repo: ""
+  repo: "sgrsaga/vuln-agent"
+
+# ── GitOps promotion PR-bot (higher environments — PPE/Prod) ──────────────
+# Opens a reviewable PR against a separate GitOps manifests repo bumping the
+# optimized image reference. Leave repo empty to disable — lower environments
+# should use ArgoCD Image Updater instead (see README, no config here).
+gitops:
+  repo: ""                        # owner/repo of the GitOps manifests repo
+  token: ""                       # falls back to github.token if unset
+  existingSecret: ""
+  existingSecretKey: "gitops-token"
+  baseBranch: "main"
+  imagePathTemplate: ""           # e.g. "environments/ppe/{repo_name}/values.yaml"
 
 # ── Private registry for patched images ───────────────────────────────────
 registry:
-  # Namespace prefix for pushed images, e.g. "ghcr.io/myorg"
-  # Leave empty to build locally without pushing.
-  namespace: ""
-  # Credentials for docker push (creates a docker-registry Secret)
+  namespace: "ghcr.io/sgrsaga"
   server: "ghcr.io"
   username: ""
-  # Password / PAT — typically same as github.token for GHCR
   password: ""
-  # -- OR -- reference an existing docker-registry Secret
-  existingSecret: ""
+  existingSecret: "vuln-agent-registry"
 
 # ── Image discovery ────────────────────────────────────────────────────────
 discovery:
@@ -41,12 +49,9 @@ discovery:
   # When set, ONLY these namespaces are scanned.
   # The agent's release namespace is never included even if listed here.
   # Leave empty ([]) to fall back to the excludedNamespaces blacklist.
-  targetNamespaces: []
-  # Examples:
-  #   targetNamespaces:
-  #     - argocd
-  #     - monitoring
-  #     - staging
+  targetNamespaces:
+    - argocd
+    - monitoring
 
   # EXCLUDED NAMESPACES (blacklist — used only when targetNamespaces is empty)
   # The agent's own release namespace is always appended automatically.
@@ -55,34 +60,73 @@ discovery:
     - kube-public
     - kube-node-lease
 
-  # Set to true to also scan images in init containers
   includeInitContainers: false
+
+  # OWNED IMAGE LABEL SELECTOR — a standard k8s label selector (kubectl -l syntax)
+  # identifying pods/deployments the org owns and can test, e.g.
+  # "vuln-agent.io/harden=true". App teams self-service by labeling their own
+  # workloads. Leave empty to disable base-image hardening entirely — it is
+  # NEVER attempted for images that don't match this selector (see hardening
+  # block below), since hardening rebuilds from source and needs the app's own
+  # tests to have any confidence the rebuild didn't break it.
+  ownedImageLabelSelector: ""
 
 # ── Scan configuration ─────────────────────────────────────────────────────
 scan:
-  # Maximum remediation loops per image before stopping
-  maxIterations: 5
+  maxIterations: 3
+  # Discovery mode only: rescan an image again after this many days even if
+  # its digest hasn't changed, so unchanged workloads still get rechecked
+  # against newly-disclosed CVEs. State is tracked on the output PVC.
+  rescanIntervalDays: 7
+  # Allow the base-image tag-bump check (agent/tag_finder.py) to cross a major
+  # version when hunting for an upstream tag that already fixes CVEs. Off by
+  # default — a major bump can change app behavior, so crossing one shouldn't
+  # happen silently in an automated remediation loop.
+  allowMajorTagBump: false
+
+# ── Base image hardening ("golden image" generation) ───────────────────────
+# Only ever attempted for images matching discovery.ownedImageLabelSelector
+# above. Each entry below maps a bare image repo name to where its source/tests
+# live — but this central list is optional: an app can instead self-service via
+# vuln-agent.io/source-repo, vuln-agent.io/dockerfile-path, and
+# vuln-agent.io/test-stage (or vuln-agent.io/test-command) annotations on its
+# own Deployment, no entry here required at all. Annotations win field-by-field
+# over a matching entry below when both are present. Claude suggests candidate
+# replacement base images; each candidate is only adopted if the app's real
+# Dockerfile test stage (or testCommand) passes AND the rebuilt image has fewer
+# vulnerabilities than before. See target-apps/ for complete working examples.
+hardening:
+  maxCandidates: 3
+  images: []
+  # - repo: myapp                    # bare image repo name (no registry/tag)
+  #   sourceRepo: myorg/myapp        # owner/repo to clone
+  #   dockerfilePath: Dockerfile
+  #   # Only the base of the stage that becomes the FINAL built image gets
+  #   # swapped (a plain `docker build` output — a builder stage's own base,
+  #   # e.g. golang/node, is never touched, since it's discarded before the
+  #   # image ships). testStage MUST share lineage with that final stage
+  #   # (e.g. `FROM runtime AS test`) — otherwise a passing test run doesn't
+  #   # actually validate the swapped base. See README's hardening section.
+  #   testStage: test                 # preferred: `docker build --target test` is the pass/fail signal
+  #   # testCommand: "pytest"         # fallback: `docker run --rm --network none <image> <cmd>`
 
 # ── CronJob schedule ───────────────────────────────────────────────────────
-# Standard cron syntax. Default: every Monday at 04:00 UTC.
-schedule: "0 4 * * 1"
+# Run every day at 02:00 UTC (or trigger manually via kubectl create job)
+schedule: "0 2 * * *"
 timeZone: "UTC"
 successfulJobsHistoryLimit: 3
 failedJobsHistoryLimit: 3
-# Prevent overlapping runs (a slow scan must finish before the next fires)
 concurrencyPolicy: Forbid
 
 # ── Persistent storage ─────────────────────────────────────────────────────
 persistence:
   output:
-    # Stores scan JSON, reports, and patch Dockerfiles
-    size: 5Gi
-    storageClass: ""      # use cluster default storage class
+    size: 10Gi
+    storageClass: "harvester"
     accessMode: ReadWriteOnce
   trivyCache:
-    # Trivy vulnerability DB cache — avoids re-downloading on every run
-    size: 2Gi
-    storageClass: ""
+    size: 5Gi
+    storageClass: "harvester"
     accessMode: ReadWriteOnce
 
 # ── Resource limits ────────────────────────────────────────────────────────
@@ -91,31 +135,31 @@ resources:
     cpu: "500m"
     memory: "512Mi"
   limits:
-    cpu: "2"
-    memory: "2Gi"
+    cpu: "4"
+    memory: "4Gi"
 
 # ── Service account ────────────────────────────────────────────────────────
 serviceAccount:
   create: true
-  # Name — auto-generated from release name if empty
   name: ""
   annotations: {}
 
 # ── RBAC ──────────────────────────────────────────────────────────────────
 rbac:
-  # Creates a ClusterRole + ClusterRoleBinding for pod/namespace listing
   create: true
 
 # ── Docker (optional — required only for building patched images) ──────────
 # When Docker is unavailable (e.g. k8s pod without socket access), the agent
 # runs in analysis-only mode: it scans, classifies, and generates Dockerfiles
 # but skips the build+push step.
-# To enable building in k8s, mount the host Docker socket via extraVolumes or
-# run the agent on a Docker-capable host (outside k8s).
 docker:
   # Set to the host Docker socket path to enable building in k8s (optional).
   # Leave empty to run in analysis-only mode (safe default for most clusters).
   hostSocketPath: ""
+
+# ── Trivy init container ───────────────────────────────────────────────────
+trivy:
+  image: "aquasec/trivy:v0.73.0"
 
 # ── Pod-level settings ─────────────────────────────────────────────────────
 nodeSelector: {}

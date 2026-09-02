@@ -1,6 +1,6 @@
 # vuln-agent
 
-An agentic pipeline that automatically scans a Docker image for vulnerabilities, generates a detailed security report using Claude AI, applies iterative patches, and pushes improved images to a private container registry — continuing until no further improvement is possible.
+An agentic pipeline that automatically scans a Docker image for vulnerabilities, deterministically applies OS-package upgrade patches, and pushes an optimized image to a private container registry — continuing until no further improvement is possible — then writes a before/after remediation summary using Claude AI.
 
 ## How it works
 
@@ -37,13 +37,23 @@ Input image
 
 **Output artifacts per run:**
 
+Only the baseline scan and one final summary are kept — no per-iteration files,
+and only one image ever reaches the registry:
+
 | Artifact | Description |
 |----------|-------------|
-| `output/scan-iter-N.json` | Full Trivy JSON output for each scan |
-| `output/report-iter-N.md` | Claude Opus 4.8 security analysis and remediation report |
-| `output/dockerfile-iter-N` | The patch Dockerfile applied in each iteration |
-| GitHub Release | All files above attached as downloadable release assets |
-| Patched image | Pushed to your registry as `<name>:<tag>-patched-iterN` |
+| `output/scan-baseline.json` | Full Trivy JSON output from the first scan, before any changes |
+| `output/summary-report.md` | Claude Opus 4.8 before/after remediation summary covering the whole run |
+| GitHub Release | Both files above attached as downloadable release assets |
+| Optimized image | Pushed to your registry as `<name>:<original-tag>-optimized` — only when something actually changed (see below) |
+
+The optimized image is only pushed when it's genuinely different from what's
+already public:
+- Nothing to patch on the first scan → no image pushed, the run is already clean.
+- A newer upstream tag alone fixes everything → nothing pushed either; that tag
+  is already public, so the summary just points at it instead of duplicating it.
+- A newer upstream tag helps but doesn't fully resolve things, or any OS-package
+  patch was applied at all → pushed as `<name>:<original-tag>-optimized`.
 
 ---
 
@@ -54,7 +64,7 @@ Input image
 | Python 3.12+ | Runtime | [python.org](https://www.python.org/downloads/) |
 | Trivy | Vulnerability scanning | [trivy.dev](https://trivy.dev/latest/getting-started/installation/) |
 | Docker CLI | Build and push patched images | [docs.docker.com](https://docs.docker.com/engine/install/) |
-| Anthropic API key | Claude Opus 4.8 (report + patch generation) | [console.anthropic.com](https://console.anthropic.com/) |
+| Anthropic API key | Claude Opus 4.8 (final before/after summary report) | [console.anthropic.com](https://console.anthropic.com/) |
 | GitHub PAT | Create releases, push artifacts | Scopes: `repo` + `write:packages` |
 
 ---
@@ -96,8 +106,22 @@ cp .env.example .env
 | `GHCR_NAMESPACE` | No | Registry prefix for pushed images, e.g. `ghcr.io/myorg`. Leave empty to build locally only |
 | `GITHUB_TOKEN` | No | GitHub PAT (`ghp_...`) with `repo` + `write:packages` scopes. Enables GitHub Release creation |
 | `GITHUB_REPO` | No | `owner/repo` or full GitHub URL. Required for release creation |
+| `TARGET_NAMESPACES` | No | Discovery mode: comma-separated namespace whitelist. Takes priority over `EXCLUDED_NAMESPACES`. Also settable via `--namespaces` |
+| `EXCLUDED_NAMESPACES` | No | Discovery mode: comma-separated namespace blacklist, used only when `TARGET_NAMESPACES` is empty. Also settable via `--exclude-namespaces` |
+| `INCLUDE_INIT_CONTAINERS` | No | Discovery mode: also scan images running in init containers (default: `false`) |
 | `MAX_ITERATIONS` | No | Safety cap on remediation loops (default: `5`) |
 | `OUTPUT_DIR` | No | Directory for artifacts (default: `output`) |
+| `ALLOW_MAJOR_TAG_BUMP` | No | Allow the base-image tag-bump check to cross a major version when hunting for a tag that already fixes CVEs (default: `false` — patch/minor bumps only) |
+| `RESCAN_INTERVAL_DAYS` | No | Discovery mode only: rescan an image again after this many days even if it hasn't changed (default: `7`) |
+| `FORCE_RESCAN` | No | Discovery mode only: ignore tracked scan state and rescan every discovered image this run (default: `false`) |
+| `GITOPS_REPO` | No | `owner/repo` of a GitOps manifests repo to open promotion PRs against. Leave empty to disable (see [Promoting optimized images](#promoting-optimized-images-to-higher-environments)) |
+| `GITOPS_TOKEN` | No | PAT with access to `GITOPS_REPO`. Falls back to `GITHUB_TOKEN` if unset |
+| `GITOPS_BASE_BRANCH` | No | Branch to open promotion PRs against (default: `main`) |
+| `GITOPS_IMAGE_PATH_TEMPLATE` | No | Path within `GITOPS_REPO` to patch, e.g. `environments/ppe/{repo_name}/values.yaml` — `{repo_name}` is filled in per image |
+| `OWNED_IMAGE_LABEL_SELECTOR` | No | k8s label selector identifying owned images eligible for base-image hardening (discovery mode only). Empty disables hardening entirely |
+| `HARDENING_CONFIG` | No | JSON list mapping owned repos to source/test config — see [Base image hardening](#base-image-hardening-golden-images-for-owned-applications) |
+| `HARDENING_MAX_CANDIDATES` | No | Max alternative base images to try per image (default: `3`) |
+| `HARDEN_BASE_IMAGE` | No | Single-image mode only: opt-in to hardening (`--harden`). Discovery mode uses `OWNED_IMAGE_LABEL_SELECTOR` instead (default: `false`) |
 
 ### 4. Log in to your private registry
 
@@ -135,15 +159,15 @@ python main.py ghcr.io/your-org/your-image:tag \
 
 ### 7. View results
 
-Artifacts are written to `output/` in real time. If `GITHUB_TOKEN` and `GITHUB_REPO` are configured, a GitHub Release is created at the end of every run with all files attached.
+Artifacts are written to `output/` in real time — only the baseline scan and the
+final summary, regardless of how many iterations the run takes internally. If
+`GITHUB_TOKEN` and `GITHUB_REPO` are configured, a GitHub Release is created at
+the end of every run with both files attached.
 
 ```
 output/
-├── scan-iter-1.json       ← full Trivy scan (63 KB)
-├── report-iter-1.md       ← Claude security report (12–15 KB)
-├── dockerfile-iter-1      ← applied patch Dockerfile
-├── scan-iter-2.json
-└── report-iter-2.md
+├── scan-baseline.json     ← full Trivy scan from before any changes (63 KB)
+└── summary-report.md      ← Claude before/after remediation summary (12–15 KB)
 ```
 
 Example output for `ghcr.io/dexidp/dex:v2.45.1`:
@@ -151,12 +175,13 @@ Example output for `ghcr.io/dexidp/dex:v2.45.1`:
 ```
 🚀  [pipeline_start] Starting remediation for ghcr.io/dexidp/dex:v2.45.1
 🔍  [scan_complete] Found 104 vulnerabilities (CRITICAL: 11, HIGH: 93)
-📋  [report_complete] Report saved → output/report-iter-1.md
-🔧  [patch_generated] Dockerfile saved → output/dockerfile-iter-1 (4 lines)
-🏗️  [build_complete] Built and pushed: ghcr.io/sgrsaga/dex:v2.45.1-patched-iter1
-✅  [improvement] Reduced by 15: 104 → 89 CVEs
+🏷️  [tag_bump_unavailable] No newer upstream tag improves on current CVEs
+🔧  [patch_generated] Patch Dockerfile generated (4 lines)
+✅  [improvement] Reduced by 15: 104 → 89 effective CVEs
 🔍  [scan_complete] Found 89 vulnerabilities (CRITICAL: 9, HIGH: 80)
 🏁  [pipeline_complete] No further patches possible — remaining CVEs require source rebuild
+✅  [final_image] Final optimized image: ghcr.io/sgrsaga/dex:v2.45.1-optimized
+ℹ️  [summary_start] Generating before/after summary report with Claude Opus 4.8 ...
 ```
 
 ---
@@ -286,6 +311,14 @@ schedule: "0 2 * * *"   # Every day at 02:00 UTC
 schedule: "0 0 1 * *"   # First day of every month
 ```
 
+Each run tracks what it already scanned in `<output-dir>/.vuln-agent-state/tracked-images.json`
+on the `output` PVC, keyed by image digest. On the next scheduled run, an image is
+skipped — not rescanned — if its digest hasn't changed and it was last checked within
+`RESCAN_INTERVAL_DAYS` (default 7); it's rescanned regardless of digest if the prior
+attempt errored out, or once the TTL passes, so a workload that never gets redeployed
+still gets rechecked periodically against newly-disclosed CVEs. Set `FORCE_RESCAN=true`
+(or `--force-rescan`) to ignore this and rescan everything on a given run.
+
 Trigger a scan immediately without waiting for the schedule:
 
 ```bash
@@ -320,7 +353,7 @@ kubectl -n security run artifact-reader --rm -it \
 
 # Inside the shell:
 ls -lh /output
-cat /output/report-iter-1.md
+cat /output/summary-report.md
 ```
 
 ---
@@ -351,6 +384,165 @@ The agent identifies these, documents them clearly in the report, and stops iter
 
 ---
 
+## Promoting optimized images to higher environments
+
+Pushing `<original-tag>-optimized` to your registry is where this agent's job
+ends — nothing in this repo rewrites a deployment manifest to actually reference
+it. That's intentional: how an optimized image flows from where it was scanned
+(typically a low-trust dev/sandbox environment) into staging, PPE, and production
+is an environment-promotion decision, not a scanning one, and different tiers
+usually want different levels of friction. Two complementary paths:
+
+### Lower environments — ArgoCD Image Updater (no code here, just config)
+
+[ArgoCD Image Updater](https://argocd-image-updater.readthedocs.io/) is a separate
+controller that polls the registry directly and writes updates back itself — this
+agent never talks to it. Install it once, then annotate the *target application's*
+`Application` resource (in whatever repo/cluster that lives in — not this chart):
+
+```yaml
+metadata:
+  annotations:
+    argocd-image-updater.argoproj.io/image-list: myapp=ghcr.io/me/argocd
+    # The -optimized tag is fixed and gets overwritten in place by each
+    # remediation run — it's not a growing semver series — so "digest" (poll
+    # the same tag, redeploy when its digest changes) is the right update
+    # strategy here, not "semver".
+    argocd-image-updater.argoproj.io/myapp.update-strategy: digest
+    argocd-image-updater.argoproj.io/myapp.allow-tags: regexp:^.*-optimized$
+    argocd-image-updater.argoproj.io/write-back-method: git
+```
+
+Image Updater needs read access to the same registry `GHCR_NAMESPACE` already
+pushes to — reuse the existing pull secret. This writes back automatically, with
+no human review by default, which is fine for fast-moving lower environments but
+not usually what you want pointed straight at production.
+
+### Higher environments (PPE/Prod) — the built-in PR-bot
+
+Set `GITOPS_REPO` (and `GITOPS_IMAGE_PATH_TEMPLATE`) and the agent will, after
+promoting a final optimized image, patch that path in `GITOPS_REPO` and open a
+PR — it never merges anything itself, so a human always reviews the change before
+it reaches a gated environment. Re-runs that produce the same result update the
+existing open PR (a stable `vuln-agent/optimize-<repo>` branch) instead of piling
+up duplicates. See the `GITOPS_*` variables in [step 3](#3-configure-environment-variables)
+above for the full configuration.
+
+---
+
+## Base image hardening — "golden images" for owned applications
+
+Everything described above operates on an image that already exists: tag-bumping
+adopts a newer *upstream* tag, OS-package patching upgrades packages on the
+*current* base. Neither ever changes which base image an app is built FROM,
+because doing that safely requires rebuilding from source and proving the app
+still works — which this agent will only ever attempt for images your
+organization actually owns and can test. It is **never** attempted for
+third-party/vendor images (e.g. `ghcr.io/dexidp/dex:v2.45.1`) — rebuilding
+someone else's software from source with a swapped dependency, with no access to
+their test suite, forfeits their QA and provenance guarantees and leaves you
+maintaining an unofficial fork with no real confidence it still behaves
+correctly. See `agent/hardener.py` for the full rationale.
+
+### How an image becomes eligible
+
+Two things both have to be true:
+1. **It's owned.** Set `discovery.ownedImageLabelSelector` (a standard k8s label
+   selector, e.g. `vuln-agent.io/harden=true`) in `chart/values.yaml`. App teams
+   self-service by labeling their own Deployments — nothing to edit centrally
+   per app. (Single-image mode has no pod/label context, so it's explicit
+   opt-in instead: `--harden` / `HARDEN_BASE_IMAGE=true`.)
+2. **It has enough config to work with** — where the source repo, Dockerfile
+   path, and test stage/command live. Two ways to provide this, and they merge
+   (annotation values win field-by-field over a matching central entry, so a
+   platform team can still set defaults while apps override what they need):
+
+   **Self-service — annotations on the app's own Deployment** (no separate file
+   to touch, ever — the config travels with the workload):
+   ```yaml
+   metadata:
+     labels:
+       vuln-agent.io/harden: "true"
+     annotations:
+       vuln-agent.io/source-repo: myorg/myapp
+       vuln-agent.io/dockerfile-path: Dockerfile
+       vuln-agent.io/test-stage: test
+       # vuln-agent.io/test-command: pytest   # fallback if there's no dedicated test stage
+   ```
+
+   **Central — `hardening.images` in `chart/values.yaml`**, keyed by bare image
+   repo name (useful for apps that haven't added annotations yet, or as a
+   platform-managed default):
+   ```yaml
+   hardening:
+     images:
+       - repo: myapp
+         sourceRepo: myorg/myapp   # cloned to rebuild against a candidate base
+         dockerfilePath: Dockerfile
+         testStage: test            # `docker build --target test` is the pass/fail signal
+         # testCommand: "pytest"    # fallback if there's no dedicated test stage
+   ```
+
+   See `target-apps/` in this repo for five complete, working examples (Python,
+   Go, Java, Node.js, TypeScript) with Dockerfiles structured to satisfy the
+   test-stage-lineage requirement below — good references when onboarding a
+   real app.
+
+### What happens for an eligible image
+
+1. `sourceRepo` is cloned, and the Dockerfile's actual current base is read —
+   whichever stage the `FROM` line for the *final built image* actually
+   resolves to (a plain `docker build` produces the last stage in the file,
+   so that's the one Trivy's scan and `current_vulns` describe). If that stage
+   is itself just an alias to an earlier one (`FROM base AS runtime`), the
+   alias chain is walked backwards until it lands on a real image reference —
+   correctly leaving earlier build-only stages alone even when they use a
+   completely different base (e.g. a `golang:1.21 AS builder` stage feeding a
+   binary into a separate `alpine:3.18 AS runtime` stage never gets touched,
+   since it doesn't ship in the built image at all).
+2. Candidate replacement bases are found in two tiers, deterministic first:
+   - **Tier 1** — is there just a newer tag of this *same* base repo? Reuses
+     the same Trivy-verified tag-bump logic the main remediation loop already
+     uses (`agent/tag_finder.py`). No LLM call happens if this alone works out.
+   - **Tier 2** — only if tier 1 found nothing, or its candidate didn't
+     actually pass the app's tests, Claude is asked for up to
+     `hardening.maxCandidates` alternatives from a genuinely different
+     family/vendor (a minimal/alpine equivalent, a distroless/chainguard image
+     for the same runtime) — this is the only step in the whole feature that
+     needs real judgment about which minimal bases exist and are plausible
+     drop-in replacements, so it's the only one that spends an LLM call.
+3. Each candidate (from either tier) that passes the build gets its base
+   swapped in, the app's real test suite run against it, and — if that passes
+   *and* a rescan shows fewer vulnerabilities than before — it's adopted: the
+   first candidate to satisfy both wins, pushed as `<original-tag>-golden`. If
+   nothing passes, that's reported (every candidate tried, from both tiers,
+   and why each failed) rather than silently doing nothing.
+
+### A residual limitation: your `test`/`testStage` needs to share lineage with the runtime stage
+
+Hardening only ever rewrites the base of the stage that becomes the *final*
+image. If your test stage is built from an unrelated base rather than
+descending from that same stage (e.g. `FROM golang:1.21 AS test` running unit
+tests, feeding into a completely separate `FROM alpine:3.18 AS runtime`), the
+test run never actually exercises the new candidate base — it validates the
+*old* environment while the *shipped* image gets the swapped one. Structure
+`test` to build on top of the runtime stage (`FROM runtime AS test`, or an
+earlier stage in the runtime's own lineage) so a passing test run is real
+evidence about the image that's actually about to be pushed.
+
+### Isolation — a known, documented limitation
+
+Test execution (`testCommand` path) runs as `docker run --rm --network none` —
+no network interface at all, so a compromised or malicious test suite in a
+cloned repo can't exfiltrate the agent's mounted credentials to an external
+host. This is a real but partial mitigation, **not full sandboxing** — it still
+shares the docker daemon and host kernel with the agent. A dedicated,
+minimally-privileged k8s Job per hardening attempt would be the proper
+production-grade isolation; it isn't built yet, so treat `sourceRepo` as a
+trusted input, not an arbitrary/untrusted one, until that lands.
+
+---
+
 ## Security considerations for production
 
 The Job manifests mount `/var/run/docker.sock` from the host node, which gives root-equivalent access to the Docker daemon. For production deployments:
@@ -368,17 +560,19 @@ The Job manifests mount `/var/run/docker.sock` from the host node, which gives r
 vuln-agent/
 ├── agent/
 │   ├── scanner.py        # Trivy wrapper — runs scan, parses JSON
-│   ├── reporter.py       # Claude Opus 4.8 — generates Markdown security report
-│   ├── patcher.py        # Claude Opus 4.8 — generates patch Dockerfile
-│   ├── builder.py        # docker build + docker push to private registry
+│   ├── go_analyzer.py    # govulncheck binary analysis — classifies Go CVEs
+│   ├── tag_finder.py     # Finds a newer upstream tag that already fixes CVEs
+│   ├── patcher.py        # Deterministic OS-package-upgrade Dockerfile (no LLM)
+│   ├── builder.py        # docker build/tag/push + crane copy to private registry
+│   ├── reporter.py       # Claude Opus 4.8 — the one before/after Markdown summary
+│   ├── promoter.py       # Opens a GitOps promotion PR for higher environments
+│   ├── hardener.py       # Golden base image hardening for owned applications
+│   ├── image_tracker.py  # Discovery-mode state: skip unchanged images
+│   ├── discoverer.py     # Lists images running across cluster namespaces
 │   ├── publisher.py      # Writes artifacts to disk; creates GitHub Release via REST API
 │   └── orchestrator.py   # Main remediation loop and termination logic
-├── k8s/
-│   ├── namespace.yaml    # security namespace
-│   ├── pvc.yaml          # output + Trivy cache PersistentVolumeClaims
-│   ├── secrets.yaml      # Secret templates (fill in values or use kubectl create)
-│   ├── job.yaml          # One-shot remediation Job
-│   └── cronjob.yaml      # Scheduled weekly scan CronJob
+├── chart/                # Helm chart — the actively-developed k8s deployment path
+├── k8s/                  # Legacy raw Job/CronJob manifests (see README's k8s section)
 ├── .github/
 │   └── workflows/
 │       └── vuln-remediate.yml  # GitHub Actions workflow (manual trigger)
