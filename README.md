@@ -491,6 +491,12 @@ helm uninstall vuln-agent -n vuln-agent
 
 ### Option B — raw manifests (`k8s/`)
 
+> **Switching between options?** Both paths create cluster-scoped RBAC named
+> `vuln-agent`, so they can't coexist. Moving from B to A: first
+> `kubectl delete clusterrole vuln-agent clusterrolebinding vuln-agent`
+> (and the old CronJob in `security`), or `helm install` fails with an
+> "invalid ownership metadata" error on the ClusterRole.
+
 #### Step 1 — Build and push the agent image
 
 ```bash

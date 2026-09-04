@@ -8,6 +8,11 @@
 #
 # Not needed for the one-shot single-image Job (k8s/job.yaml) — that mode
 # never talks to the Kubernetes API.
+#
+# NOTE: the Helm chart creates cluster-scoped RBAC with the SAME names
+# (ClusterRole/ClusterRoleBinding "vuln-agent"), so this file and the chart
+# cannot coexist on one cluster. Switching to the chart? Delete these first:
+#   kubectl delete clusterrole vuln-agent clusterrolebinding vuln-agent
 apiVersion: v1
 kind: ServiceAccount
 metadata:
