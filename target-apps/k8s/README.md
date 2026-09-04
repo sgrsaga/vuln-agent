@@ -5,22 +5,35 @@ Manifests for running all five target apps in the `apps` namespace as
 picks them up and takes them through the full internal pipeline (base ladder →
 standalone base artifact → dependency loop → golden/optimized outcome).
 
-## One monorepo for all apps
+## One shared repo: apps + reports side by side
 
-All five apps live in a single GitHub repo (`sgrsaga/target-apps` by default).
+All five apps live in the **same repo the agent writes its reports into**
+(`sgrsaga/reports` by default — matching `reports.repo` in `chart/values.yaml`),
+each under its own folder, so application code and the remediation reports
+about it sit in one place:
+
+```
+sgrsaga/reports
+├── python-app/        ← app source (this script publishes these)
+├── go-app/ …          ← one folder per app
+└── reports/           ← written by the agent (per-image + run summaries)
+```
+
 The hardening pipeline clones `vuln-agent.io/source-repo` and **builds the
 directory that holds `vuln-agent.io/dockerfile-path`**: with
 `dockerfile-path: python-app/Dockerfile` the agent uses `python-app/` inside
 the clone as the build context, and the dependency manifests the dep loop
 edits (`requirements.txt`, `package.json`, `go.mod`, `pom.xml`) are looked up
-there too. `publish-apps.sh` pushes the whole target-apps tree into that one
-repo and builds/pushes each app's image from its subdirectory in one step.
+there too. `publish-apps.sh` syncs only the app folders (never touching
+`reports/`, never force-pushing), logs docker into ghcr.io itself, and
+builds/pushes each app's image from its subdirectory in one step.
 
 ## Setup
 
 ```bash
-# 1. Publish the monorepo + per-app images (idempotent; re-run after editing an app)
-GITHUB_TOKEN=ghp_... ./publish-apps.sh sgrsaga v1 target-apps
+# 1. Publish the app folders + per-app images (idempotent; re-run after editing an app)
+#    Token needs classic scopes: repo + write:packages
+GITHUB_TOKEN=ghp_... ./publish-apps.sh sgrsaga v1 reports
 
 # 2. Namespace + pull secret
 kubectl apply -f namespace.yaml

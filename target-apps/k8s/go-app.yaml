@@ -8,8 +8,8 @@
 # entry needed.
 #
 # PREREQUISITE: the agent clones source-repo and builds the directory holding
-# dockerfile-path, so all apps live together in the target-apps monorepo — see
-# target-apps/k8s/README.md for the publish script that sets that up.
+# dockerfile-path, so all apps live together in the shared sgrsaga/reports repo
+# (next to the reports/ folder the agent writes) — see target-apps/k8s/README.md.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,7 +29,7 @@ spec:
         app: go-app
         vuln-agent.io/harden: "true"
       annotations:
-        vuln-agent.io/source-repo: "sgrsaga/target-apps"
+        vuln-agent.io/source-repo: "sgrsaga/reports"
         vuln-agent.io/dockerfile-path: "go-app/Dockerfile"
         vuln-agent.io/test-stage: "test"
     spec:
