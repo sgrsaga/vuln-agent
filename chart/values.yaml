@@ -2,7 +2,7 @@
 image:
   repository: ghcr.io/sgrsaga/vuln-agent
   tag: ""
-  digest: "sha256:1cfc906c15c0e0edf5276f8720413e986d3a1618eaebdb516f94fe6020f870c4"
+  digest: "sha256:18c3d5035d9c62e451590fa1634aecfb39a2feaa3127b7ea8cc947bf54a801f8"
   pullPolicy: IfNotPresent
 
 # ── Anthropic API credentials ─────────────────────────────────────────────
@@ -153,11 +153,11 @@ concurrencyPolicy: Forbid
 persistence:
   output:
     size: 10Gi
-    storageClass: "harvester"
+    storageClass: "local-path"   # must match the LIVE PVC — spec is immutable once bound
     accessMode: ReadWriteOnce
   trivyCache:
     size: 5Gi
-    storageClass: "harvester"
+    storageClass: "local-path"   # must match the LIVE PVC — spec is immutable once bound
     accessMode: ReadWriteOnce
 
 # ── Resource limits ────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ docker:
 
 # ── Trivy init container ───────────────────────────────────────────────────
 trivy:
-  image: "aquasec/trivy:v0.73.0"
+  image: "aquasec/trivy:0.74.0"
 
 # ── Pod-level settings ─────────────────────────────────────────────────────
 nodeSelector: {}

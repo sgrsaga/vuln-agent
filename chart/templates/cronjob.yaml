@@ -53,6 +53,11 @@ spec:
               restartPolicy: Always
               securityContext:
                 privileged: true
+              # --group=0: own the socket with gid 0 — the agent container runs
+              # as the non-root "agent" user whose supplementary groups include
+              # root(0), while dind's default "docker" group gid exists only
+              # inside the dind image and would leave the socket unreadable.
+              args: ["--group=0"]
               env:
                 - name: DOCKER_TLS_CERTDIR
                   value: ""          # unix socket only — no TCP, no TLS bootstrap
