@@ -1,0 +1,55 @@
+# nodejs-app — sample owned workload for real vuln-agent testing.
+#
+# The pod LABEL vuln-agent.io/harden=true is what marks it as an owned image
+# (must match the agent's OWNED_IMAGE_LABEL_SELECTOR / ownedImageLabelSelector).
+# The vuln-agent.io/* ANNOTATIONS are the self-service hardening config the
+# agent reads straight off the pod: which repo to clone, where the Dockerfile
+# is, and which build stage is the test gate. No central HARDENING_CONFIG
+# entry needed.
+#
+# PREREQUISITE: the agent clones source-repo and builds from its ROOT, so this
+# app must live in its own GitHub repo (Dockerfile at the top level) — see
+# target-apps/k8s/README.md for the publish script that sets that up.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodejs-app
+  namespace: apps
+  labels:
+    app: nodejs-app
+    app.kubernetes.io/part-of: vuln-agent-target-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nodejs-app
+  template:
+    metadata:
+      labels:
+        app: nodejs-app
+        vuln-agent.io/harden: "true"
+      annotations:
+        vuln-agent.io/source-repo: "sgrsaga/nodejs-app"
+        vuln-agent.io/dockerfile-path: "Dockerfile"
+        vuln-agent.io/test-stage: "test"
+    spec:
+      imagePullSecrets:
+        - name: ghcr-credentials
+      containers:
+        - name: nodejs-app
+          image: ghcr.io/sgrsaga/nodejs-app:v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

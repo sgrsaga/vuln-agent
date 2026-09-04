@@ -91,7 +91,7 @@ discovery:
   # NEVER attempted for images that don't match this selector (see hardening
   # block below), since hardening rebuilds from source and needs the app's own
   # tests to have any confidence the rebuild didn't break it.
-  ownedImageLabelSelector: ""
+  ownedImageLabelSelector: "vuln-agent.io/harden=true"   # matches target-apps/k8s deployments
 
 # ── Scan configuration ─────────────────────────────────────────────────────
 scan:

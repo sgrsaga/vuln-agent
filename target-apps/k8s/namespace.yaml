@@ -1,0 +1,8 @@
+# Namespace the sample workloads run in — matches the agent's
+# discovery.targetNamespaces whitelist in chart/values.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apps
+  labels:
+    app.kubernetes.io/part-of: vuln-agent-target-apps
