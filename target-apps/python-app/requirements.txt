@@ -1,1 +1,5 @@
-flask==3.0.3
+# Deliberately old pins with known CVEs (e.g. werkzeug CVE-2023-25577) — a
+# fixture so vuln-agent's dependency-upgrade loop has something real to fix.
+# See target-apps/README.md.
+flask==2.2.2
+werkzeug==2.2.2

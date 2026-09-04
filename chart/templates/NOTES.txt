@@ -39,7 +39,13 @@ vuln-agent has been installed as release "{{ .Release.Name }}" in namespace "{{ 
   ⚠  registry.namespace is not set — patched images will be built locally
      but NOT pushed to a registry. Set it to enable registry push.
 {{- else }}
-  Optimized images are pushed to: {{ .Values.registry.namespace }}/<name>:<original-tag>-optimized
+  Final images are pushed to {{ .Values.registry.namespace }}/<name>: as
+    <original-tag>-optimized-ext     external images (gated by registry.keepExternalImages)
+    <original-tag>-golden-base-app   internal images: zero TOTAL CVEs, tests passing
+    <original-tag>-optimized-app     internal images: best balanced pick (may be
+                                     flagged NON-DEPLOYABLE if its tests failed)
+    <base-tag>-golden-base           winning base built standalone, zero CVEs
+    <base-tag>-optimized-base        winning base built standalone, reduced
   (only when the run actually changed something — see summary-report.md)
 {{- end }}
 

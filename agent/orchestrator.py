@@ -3,7 +3,6 @@ Main agentic remediation loop.
 
 Per iteration:
   1. Scan current image with Trivy              → iteration 1 only: save scan-baseline.json
-  1b. govulncheck binary analysis (iter 1 only) → cached, folded into the final summary
   1c. Check upstream for a newer tag that already fixes CVEs; adopt it via
       crane copy and restart the loop if one improves on the current image
       (no Docker daemon required, so this runs even without one available)
@@ -30,15 +29,15 @@ are persisted (see agent/publisher.py).
 import logging
 import os
 
-from .scanner import scan_image, extract_vulnerabilities
+from .scanner import scan_image, extract_vulnerabilities, extract_os_info, severity_key
 from .reporter import generate_summary_report
 from .patcher import generate_patch
 from .builder import build_image, push_image, copy_image, tag_local_image, docker_available
-from .go_analyzer import analyze_go_vulns, summary_line as go_summary
+from . import hardener
 from . import tag_finder
 from . import promoter
 from . import publisher
-from .publisher import publish_scan, publish_summary, publish_event, publish_go_analysis
+from .publisher import publish_scan, publish_summary, publish_event
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +45,25 @@ MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "5"))
 ALLOW_MAJOR_TAG_BUMP = os.environ.get("ALLOW_MAJOR_TAG_BUMP", "false").lower() == "true"
 GHCR_NAMESPACE = (os.environ.get("GHCR_NAMESPACE") or "").rstrip("/")
 
+# External images: keep a patched copy in the private registry at all? Spec
+# guidance is that keeping third-party images is discouraged (upstream will
+# eventually ship the fix) but it's the team's call — default ON preserves
+# existing behavior.
+KEEP_EXTERNAL_IMAGES = os.environ.get("KEEP_EXTERNAL_IMAGES", "true").lower() == "true"
+HARDENING_MAX_CANDIDATES = int(os.environ.get("HARDENING_MAX_CANDIDATES", "3"))
+
 # Higher-environment promotion (PR-bot) — unset GITOPS_REPO disables it entirely.
 GITOPS_REPO = os.environ.get("GITOPS_REPO", "")
 GITOPS_TOKEN = os.environ.get("GITOPS_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
 GITOPS_BASE_BRANCH = os.environ.get("GITOPS_BASE_BRANCH", "main")
 GITOPS_IMAGE_PATH_TEMPLATE = os.environ.get("GITOPS_IMAGE_PATH_TEMPLATE", "")
 
+# File the adjudication's code-fix suggestions as an issue on the app's own
+# source repo when a balanced pick is non-deployable (tests failed).
+CODE_FIX_ISSUES = os.environ.get("CODE_FIX_ISSUES", "true").lower() == "true"
 
-def run(image_ref: str, create_release: bool = True) -> dict:
+
+def run(image_ref: str, create_release: bool = True, internal_config: dict | None = None) -> dict:
     """
     Drive the full remediation pipeline for a single image.
 
@@ -62,6 +72,12 @@ def run(image_ref: str, create_release: bool = True) -> dict:
         create_release:  If True, call create_github_release() at the end.
                          Set to False in discovery/multi-image mode so the
                          caller can create one combined release after all images.
+        internal_config: When set, this is an OWNED image — skip the external
+                         image-layer remediation entirely (its OS patches are
+                         never test-verified) and run the internal
+                         rebuild-from-source pipeline instead
+                         (hardener.remediate_internal: base ladder + dependency
+                         loop, every step test-gated).
 
     Returns a summary dict with keys: status, final_image, iterations, remaining_vulns.
     """
@@ -71,11 +87,6 @@ def run(image_ref: str, create_release: bool = True) -> dict:
     current_image = image_ref
     iteration = 0
     unbuilt_dockerfile: str | None = None
-
-    # go_analysis is computed once on the original image and reused for all
-    # iterations — Go binaries don't change when OS packages are patched.
-    # (Invalidated on a tag bump — see below.)
-    go_analysis: dict | None = None
 
     # "original" | "tag_bump" | "local_build" — how current_image was last adopted.
     # Determines which mechanism promotes it to <original-tag>-optimized at the end:
@@ -95,6 +106,10 @@ def run(image_ref: str, create_release: bool = True) -> dict:
 
     baseline_vulns: list[dict] | None = None
     final_vulns: list[dict] = []
+    trail: list[dict] = []
+    deployable = True
+    judgment: dict | None = None
+    base_artifact: dict | None = None
     status = "unknown"
 
     publish_event("pipeline_start", f"Starting remediation for `{image_ref}`", {
@@ -138,40 +153,45 @@ def run(image_ref: str, create_release: bool = True) -> dict:
             status = "clean"
             break
 
-        # ── 1b. Go binary analysis (first iteration only) ─────────────────────
-        # Run govulncheck on each affected binary to classify Go CVEs precisely.
-        # Results are cached — the binaries don't change between OS-layer patches.
-        go_vulns = [v for v in vulns if v["type"] == "gobinary"]
-        if go_vulns and go_analysis is None:
-            publish_event(
-                "go_analysis_start",
-                f"Running govulncheck on {len(go_vulns)} Go binary CVE(s) to identify "
-                "false positives and unreachable call paths …",
+        # ── Internal (owned) image: rebuild-from-source pipeline ───────────────
+        # Everything test-gated: base ladder (tag bump → OS patch → LLM base)
+        # then the dependency loop. No image-layer patching — an owned app never
+        # ships a change its own test suite didn't pass.
+        if internal_config is not None:
+            publish_event("internal_start",
+                f"🏗️  Internal remediation for `{image_ref}` — base ladder + dependency loop, "
+                "every step rebuild/test/rescan-gated")
+            result = hardener.remediate_internal(
+                image_ref, internal_config, vulns, extract_os_info(raw_scan),
+                HARDENING_MAX_CANDIDATES,
             )
-            try:
-                go_analysis = analyze_go_vulns(current_image, go_vulns)
-                publish_go_analysis(image_ref, iteration, go_analysis)
-                publish_event(
-                    "go_analysis_complete",
-                    f"Go binary analysis: {go_summary(go_analysis)}",
-                    {
-                        "false_positives": len(go_analysis["false_positives"]),
-                        "unexploitable": len(go_analysis["unexploitable"]),
-                        "confirmed": len(go_analysis["confirmed"]),
-                        "skipped": len(go_analysis["skipped"]),
-                    },
-                )
-            except Exception as exc:
-                publish_event("error", f"Go binary analysis failed (non-fatal): {exc}")
-                go_analysis = {}  # empty dict — analysis unavailable but don't block
+            trail = result["trail"]
+            for t in trail:
+                publish_event("internal_step", f"  [{t['step']}] {t['detail']} → {t['outcome']}")
+            deployable = result["deployable"]
+            judgment = result["judgment"]
+            base_artifact = result["base_artifact"]
+            if base_artifact and base_artifact.get("published"):
+                publish_event("base_artifact",
+                    f"🧱 Base artifact published: `{base_artifact['published']}`")
+            if result["final_tag"]:
+                current_image = result["final_tag"]
+                current_image_source = "internal_build"
+                final_vulns = result["final_vulns"]
+                # Strict golden: zero total CVEs AND tests passing; anything
+                # else that improved is the balanced pick.
+                status = ("golden_base_app"
+                          if severity_key(final_vulns) == (0, 0) and deployable
+                          else "optimized_app")
+            else:
+                status = "no_improvement"
+            break
 
         # ── 1c. Base image tag bump ─────────────────────────────────────────────
         # Check upstream for a newer tag that already fixes CVEs before generating
         # a patch for an image we might be about to replace outright. Uses
         # crane copy — no Docker daemon required, so this runs even in no_docker
-        # environments. Compared with raw vuln count, not effective_vulns: a
-        # different upstream tag likely has different (rebuilt) binaries, so the
-        # cached go_analysis false-positive suppression doesn't apply to it.
+        # environments.
         if baseline_tag:
             candidate = tag_finder.find_better_tag(
                 origin_repo, baseline_tag, len(vulns), allow_major=ALLOW_MAJOR_TAG_BUMP,
@@ -205,51 +225,27 @@ def run(image_ref: str, create_release: bool = True) -> dict:
                     current_image_source = "tag_bump"
                     baseline_tag = candidate["tag"]
                     final_vulns = candidate["vulns"]
-                    go_analysis = None  # binaries differ in the new tag — drop stale cache
                     continue
             else:
                 publish_event("tag_bump_unavailable",
                     "No newer upstream tag improves on current CVEs")
 
-        # Effective vuln count excludes govulncheck-confirmed false positives
-        fp_ids = {v["id"] for v in (go_analysis or {}).get("false_positives", [])}
-        effective_vulns = [v for v in vulns if v["id"] not in fp_ids]
-        if fp_ids:
-            publish_event(
-                "false_positives_suppressed",
-                f"Suppressing {len(fp_ids)} govulncheck false positive(s) — "
-                f"effective vulnerability count: {len(effective_vulns)}",
-            )
-
         # ── 2. Generate patch Dockerfile (deterministic, no LLM) ────────────────
         publish_event("patch_start", "Generating OS-package-upgrade Dockerfile ...")
         try:
-            dockerfile = generate_patch(current_image, iteration, vulns, go_analysis or None)
+            dockerfile = generate_patch(current_image, iteration, vulns)
         except Exception as exc:
             publish_event("error", f"Patch generation failed: {exc}")
             status = "patch_error"
             break
 
         if dockerfile is None:
-            # Distinguish why we stopped: govulncheck may have reclassified most Go vulns
-            confirmed_go = len((go_analysis or {}).get("confirmed", []))
-            unexploitable_go = len((go_analysis or {}).get("unexploitable", []))
-            fp_go = len((go_analysis or {}).get("false_positives", []))
-            stop_msg = (
+            publish_event("pipeline_complete",
                 "🏁 No further Dockerfile patches possible. "
-                f"Remaining: {len(effective_vulns)} effective CVEs"
-            )
-            if go_analysis:
-                stop_msg += (
-                    f" ({confirmed_go} confirmed Go CVEs need source rebuild, "
-                    f"{unexploitable_go} unexploitable / risk-accepted, "
-                    f"{fp_go} Trivy false positives suppressed)"
-                )
-            else:
-                stop_msg += " (remaining CVEs require source rebuild)"
-            publish_event("pipeline_complete", stop_msg, {
+                f"Remaining: {len(vulns)} CVEs (remaining CVEs are not OS-fixable — "
+                "e.g. compiled-in dependencies needing a source rebuild)", {
                 "final_image": current_image,
-                "remaining_vulns": len(effective_vulns),
+                "remaining_vulns": len(vulns),
                 "iterations": iteration,
             })
             status = "no_further_patches"
@@ -264,9 +260,8 @@ def run(image_ref: str, create_release: bool = True) -> dict:
             publish_event(
                 "build_skipped",
                 "⚠️  Docker daemon not available — skipping build in this environment. "
-                "The generated patch is included in the summary report for manual use. "
-                "Go binary CVEs require source rebuilds; see the summary for instructions.",
-                {"remaining_vulns": len(effective_vulns)},
+                "The generated patch is included in the summary report for manual use.",
+                {"remaining_vulns": len(vulns)},
             )
             status = "no_docker"
             break
@@ -294,23 +289,19 @@ def run(image_ref: str, create_release: bool = True) -> dict:
             break
 
         new_vulns = extract_vulnerabilities(new_raw)
-        # Compare using effective counts (false positives excluded)
-        new_fp_ids = {v["id"] for v in (go_analysis or {}).get("false_positives", [])}
-        new_effective = [v for v in new_vulns if v["id"] not in new_fp_ids]
-        improvement = len(effective_vulns) - len(new_effective)
 
-        if improvement <= 0:
+        if severity_key(new_vulns) >= severity_key(vulns):
             publish_event("no_improvement",
-                f"⚠️  Patch gave no CVE reduction ({len(effective_vulns)} → {len(new_effective)}) — "
-                "discarding this build.",
-                {"before": len(effective_vulns), "after": len(new_effective)})
+                f"⚠️  Patch gave no severity reduction ((C,H) {severity_key(vulns)} → "
+                f"{severity_key(new_vulns)}) — discarding this build.",
+                {"before": len(vulns), "after": len(new_vulns)})
             status = "no_improvement"
             break
 
         # ── 5. Adopt locally — pushing is deferred to the final promotion step ─
         publish_event("improvement",
-            f"✅ Reduced by {improvement}: {len(effective_vulns)} → {len(new_effective)} effective CVEs",
-            {"before": len(effective_vulns), "after": len(new_effective), "fixed": improvement})
+            f"✅ Severity reduced: (C,H) {severity_key(vulns)} → {severity_key(new_vulns)}",
+            {"before": len(vulns), "after": len(new_vulns)})
 
         current_image = new_image
         current_image_source = "local_build"
@@ -324,7 +315,9 @@ def run(image_ref: str, create_release: bool = True) -> dict:
     return _finish(
         status, image_ref, current_image, current_image_source,
         origin_repo, original_tag, iteration,
-        baseline_vulns, final_vulns, go_analysis, unbuilt_dockerfile, create_release,
+        baseline_vulns, final_vulns, unbuilt_dockerfile, trail,
+        deployable, judgment, base_artifact, create_release,
+        internal_source_repo=(internal_config or {}).get("sourceRepo"),
     )
 
 
@@ -338,82 +331,137 @@ def _finish(
     iteration: int,
     baseline_vulns: list[dict] | None,
     final_vulns: list[dict],
-    go_analysis: dict | None,
     unbuilt_dockerfile: str | None,
+    trail: list[dict],
+    deployable: bool,
+    judgment: dict | None,
+    base_artifact: dict | None,
     create_release: bool,
+    internal_source_repo: str | None = None,
 ) -> dict:
     """
-    Single epilogue for every loop exit: promote the final image (if warranted)
-    to <original-tag>-optimized, generate the one before/after summary report,
-    and create the GitHub Release.
+    Single epilogue for every loop exit: name and push the final image per the
+    two-scope model, generate the one before/after summary report, and create
+    the GitHub Release.
+
+    Naming: internal (test-verified rebuild) → `-golden-base-app` (strict
+    golden: zero total CVEs, tests passing) or `-optimized-app` (best balanced
+    pick; may be marked non-deployable when it carries test failures — the
+    GitOps PR never fires for those). External → `-optimized-ext` for any real
+    improvement — including a tag bump alone reaching zero (spec 1.1) — gated
+    by KEEP_EXTERNAL_IMAGES. The standalone base artifact
+    (`-golden-base`/`-optimized-base`) is published by hardener, not here.
     """
     final_image = current_image
-    is_clean = not final_vulns
 
-    # A tag bump alone reaching fully clean needs no promotion — it's already a
-    # public, referenceable upstream tag, so duplicating it adds nothing. Every
-    # other case where something actually changed does get promoted: an OS patch
-    # always produces content that only exists in our own local build, and a tag
-    # bump that didn't fully clear vulnerabilities is worth a stable reference.
-    should_promote = current_image_source == "local_build" or (
-        current_image_source == "tag_bump" and not is_clean
-    )
-
-    if should_promote and origin_repo and original_tag:
+    if origin_repo and original_tag and current_image_source != "original":
         repo = tag_finder.repo_name(origin_repo)
-        final_tag = f"{original_tag}-optimized"
         try:
-            if current_image_source == "local_build":
-                final_ref = (f"{GHCR_NAMESPACE}/{repo}:{final_tag}" if GHCR_NAMESPACE
-                             else f"{repo}:{final_tag}")
+            if current_image_source == "internal_build":
+                golden = status == "golden_base_app"
+                suffix = "golden-base-app" if golden else "optimized-app"
+                final_ref = (f"{GHCR_NAMESPACE}/{repo}:{original_tag}-{suffix}" if GHCR_NAMESPACE
+                             else f"{repo}:{original_tag}-{suffix}")
                 tag_local_image(current_image, final_ref)
                 if GHCR_NAMESPACE:
                     push_image(final_ref)
                 final_image = final_ref
-                publish_event("final_image", f"✅ Final optimized image: `{final_ref}`",
+                marker = "🏆" if golden else ("📦" if deployable else "⚠️ NON-DEPLOYABLE")
+                publish_event("final_image",
+                    f"{marker} Final image: `{final_ref}`",
+                    {"image": final_ref, "deployable": deployable})
+            elif not KEEP_EXTERNAL_IMAGES:
+                publish_event("external_not_kept",
+                    "External image improved, but KEEP_EXTERNAL_IMAGES=false — "
+                    "verified result discarded per policy, details in the summary report")
+            elif current_image_source == "local_build":
+                final_ref = (f"{GHCR_NAMESPACE}/{repo}:{original_tag}-optimized-ext" if GHCR_NAMESPACE
+                             else f"{repo}:{original_tag}-optimized-ext")
+                tag_local_image(current_image, final_ref)
+                if GHCR_NAMESPACE:
+                    push_image(final_ref)
+                final_image = final_ref
+                publish_event("final_image", f"📦 Final optimized image: `{final_ref}`",
                     {"image": final_ref})
-            elif GHCR_NAMESPACE:  # tag_bump, not fully clean
-                final_ref = f"{GHCR_NAMESPACE}/{repo}:{final_tag}"
+            elif current_image_source == "tag_bump" and GHCR_NAMESPACE:
+                # Includes the fully-clean tag-bump case (spec 1.1: "if new
+                # image has zero vulnerabilities keep it").
+                final_ref = f"{GHCR_NAMESPACE}/{repo}:{original_tag}-optimized-ext"
                 copy_image(current_image, final_ref)
                 final_image = final_ref
-                publish_event("final_image", f"✅ Final optimized image: `{final_ref}`",
+                publish_event("final_image", f"📦 Final optimized image: `{final_ref}`",
                     {"image": final_ref})
-            # tag_bump with no GHCR_NAMESPACE: nothing to rename into (can't push a
-            # new tag into someone else's upstream repo) — final_image stays the
-            # adopted upstream ref, reported as-is in the summary.
+            # tag_bump with no GHCR_NAMESPACE: nothing to rename into —
+            # final_image stays the adopted upstream ref.
         except Exception as exc:
             publish_event("error", f"Failed to promote final image: {exc}")
+
+    # ── Summary report (generated first — the PR body and reports repo reuse it) ─
+    full_report: str | None = None
+    if baseline_vulns is not None:
+        publish_event("summary_start", "Generating before/after summary report with Claude Opus 4.8 ...")
+        try:
+            summary = generate_summary_report(
+                image_ref, final_image, status, iteration,
+                baseline_vulns, final_vulns, unbuilt_dockerfile,
+                trail or None, deployable, judgment, base_artifact,
+            )
+        except Exception as exc:
+            publish_event("error", f"Summary report generation failed: {exc}")
+            summary = f"*Summary report generation failed: {exc}*"
+        full_report = publish_summary(image_ref, final_image, status, summary)
+
+        # Commit to the reports repo (REPORTS_REPO — no-op when unset): dated
+        # record + stable latest.md, so developers can read/diff/deep-link the
+        # report instead of downloading release assets.
+        if origin_repo and original_tag:
+            try:
+                report_url = publisher.push_summary_reports(
+                    tag_finder.repo_name(origin_repo), original_tag, full_report,
+                )
+                if report_url:
+                    publish_event("report_published", f"📚 Report committed: {report_url}",
+                                  {"url": report_url})
+            except Exception as exc:
+                publish_event("error", f"Reports-repo push failed: {exc}")
 
     # ── Higher-environment promotion (PR-bot) ───────────────────────────────────
     # Opens a reviewable PR against a separate GitOps repo bumping the image
     # reference — never auto-merges. Independent of the lower-environment path
     # (ArgoCD Image Updater polls the registry directly, no hook needed here).
-    if GITOPS_REPO and GITOPS_IMAGE_PATH_TEMPLATE and origin_repo and final_image != image_ref:
+    # The summary report rides along in the PR body so reviewers see the
+    # security story exactly where they approve the change.
+    if GITOPS_REPO and GITOPS_IMAGE_PATH_TEMPLATE and origin_repo and final_image != image_ref and deployable:
         repo = tag_finder.repo_name(origin_repo)
         try:
             pr_url = promoter.open_promotion_pr(
                 GITOPS_REPO, GITOPS_TOKEN, GITOPS_BASE_BRANCH,
                 GITOPS_IMAGE_PATH_TEMPLATE.format(repo_name=repo), repo, final_image,
+                summary=full_report,
             )
             if pr_url:
                 publish_event("promotion_pr", f"📬 Opened promotion PR: {pr_url}", {"pr_url": pr_url})
         except Exception as exc:
             publish_event("error", f"Failed to open promotion PR: {exc}")
 
-    if baseline_vulns is not None:
-        publish_event("summary_start", "Generating before/after summary report with Claude Opus 4.8 ...")
+    # ── Non-deployable balanced pick → code-fix issue on the app's source repo ──
+    # The adjudication's code_fixes are developer action items; an issue puts
+    # them in the team's normal triage flow instead of a report nobody opens.
+    if (CODE_FIX_ISSUES and not deployable and judgment and internal_source_repo
+            and os.environ.get("GITHUB_TOKEN")):
+        crit, high = severity_key(final_vulns)
         try:
-            summary = generate_summary_report(
-                image_ref, final_image, status, iteration,
-                baseline_vulns, final_vulns, go_analysis or None, unbuilt_dockerfile,
+            issue_url = promoter.open_code_fix_issue(
+                internal_source_repo, os.environ["GITHUB_TOKEN"],
+                image_ref, final_image, judgment, crit, high,
             )
+            if issue_url:
+                publish_event("code_fix_issue", f"🐛 Code-fix issue filed: {issue_url}",
+                              {"url": issue_url})
         except Exception as exc:
-            publish_event("error", f"Summary report generation failed: {exc}")
-            summary = f"*Summary report generation failed: {exc}*"
-        publish_summary(image_ref, final_image, status, summary)
+            publish_event("error", f"Failed to open code-fix issue: {exc}")
 
-    fp_ids = {v["id"] for v in (go_analysis or {}).get("false_positives", [])}
-    remaining = len([v for v in final_vulns if v["id"] not in fp_ids])
+    remaining = len(final_vulns)
 
     return _done(status, final_image, iteration, remaining, create_release)
 

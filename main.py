@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -68,57 +69,22 @@ def _print_summary(results: list[tuple[str, dict]]) -> None:
     print("=" * 60)
 
 
-def _maybe_harden(
-    image: str,
-    result: dict,
-    hardening_config: dict,
-    max_candidates: int,
-    annotation_overrides: dict | None = None,
-) -> None:
+def _internal_config_for(image: str, hardening_config: dict, annotation_overrides: dict | None) -> dict | None:
     """
-    Attempt base-image hardening for an already-remediated image, if the merged
-    config (HARDENING_CONFIG entry, overridden field-by-field by any
-    vuln-agent.io/* annotations on the owning pod) has enough to work with and
-    the image still has vulnerabilities worth trying to reduce further. No-op
-    otherwise — callers don't need to pre-filter beyond ownership, this checks
-    everything else itself.
+    The merged internal-remediation config for an owned image (central
+    HARDENING_CONFIG entry, overridden field-by-field by any vuln-agent.io/*
+    annotations on the owning pod), or None if there's no usable sourceRepo —
+    in which case the image is treated as external (can't rebuild without
+    source, per the two-scope model).
     """
-    import agent.publisher as pub
-    import agent.hardener as hardener
-    from agent.scanner import scan_image, extract_vulnerabilities, extract_os_info
     from agent import tag_finder
 
-    if not ((result.get("remaining_vulns") or 0) > 0 and result.get("final_image")):
-        return
     split = tag_finder.split_ref(image)
     repo_name = tag_finder.repo_name(split[0]) if split else None
     entry = {**hardening_config.get(repo_name, {}), **(annotation_overrides or {})}
     if not entry.get("sourceRepo"):
-        return
-
-    pub.publish_event("hardening_start", f"Attempting base-image hardening for `{image}` ...")
-    try:
-        raw_scan = scan_image(result["final_image"])
-        current_vulns = extract_vulnerabilities(raw_scan)
-        os_info = extract_os_info(raw_scan)
-        harden_result = hardener.harden_image(
-            image, entry, current_vulns, os_info, max_candidates,
-        )
-    except Exception as exc:
-        logger.error(f"Hardening failed for {image}: {exc}", exc_info=True)
-        pub.publish_event("error", f"Hardening failed for {image}: {exc}")
-        return
-
-    if harden_result:
-        pub.publish_event(
-            "hardening_complete",
-            f"✅ Hardened `{image}`: {harden_result['base_used']} "
-            f"({harden_result['vulns_before']} → {harden_result['vulns_after']} vulns) "
-            f"→ `{harden_result['golden_image']}`",
-            harden_result,
-        )
-    else:
-        pub.publish_event("hardening_no_candidate", f"No viable hardened base found for `{image}`")
+        return None
+    return entry
 
 
 def run_single(args) -> int:
@@ -129,12 +95,14 @@ def run_single(args) -> int:
     output_dir = Path(args.output_dir)
     pub.set_output_dir(output_dir)
 
-    result = run(args.image, create_release=True)
-
+    internal_config = None
     harden_flag = getattr(args, "harden", False) or os.environ.get("HARDEN_BASE_IMAGE", "false").lower() == "true"
     if harden_flag:
-        max_candidates = int(os.environ.get("HARDENING_MAX_CANDIDATES", "3"))
-        _maybe_harden(args.image, result, hardener.load_hardening_config(), max_candidates)
+        internal_config = _internal_config_for(args.image, hardener.load_hardening_config(), None)
+        if internal_config is None:
+            logger.warning(f"--harden set but no usable HARDENING_CONFIG entry for {args.image} — treating as external")
+
+    result = run(args.image, create_release=True, internal_config=internal_config)
 
     print()
     print("=" * 60)
@@ -147,7 +115,7 @@ def run_single(args) -> int:
     print(f"  Artifacts     : {output_dir}/")
     print("=" * 60)
 
-    return 0 if result["status"] == "clean" else 1
+    return 0 if result["status"] in ("clean", "golden_base_app") else 1
 
 
 def run_discovery(args) -> int:
@@ -162,7 +130,6 @@ def run_discovery(args) -> int:
     ttl_days = int(os.environ.get("RESCAN_INTERVAL_DAYS", str(tracker.DEFAULT_TTL_DAYS)))
     owned_label_selector = os.environ.get("OWNED_IMAGE_LABEL_SELECTOR", "")
     hardening_config = hardener.load_hardening_config()
-    hardening_max_candidates = int(os.environ.get("HARDENING_MAX_CANDIDATES", "3"))
 
     # Target namespaces (whitelist) — takes priority over excluded list
     targets: list[str] = []
@@ -261,8 +228,20 @@ def run_discovery(args) -> int:
         image_output = base_output / _slugify(image)
         pub.set_output_dir(image_output)
 
+        # Owned images with a usable config take the internal (rebuild-from-
+        # source, everything test-verified) pipeline; everything else is
+        # external (tag bump + OS patch only).
+        internal_config = None
+        if image in owned_images:
+            internal_config = _internal_config_for(image, hardening_config, owned_images[image])
+            if internal_config is None:
+                logger.warning(
+                    f"{image} is labeled as owned but has no usable sourceRepo config "
+                    "— treating as external"
+                )
+
         try:
-            result = run(image, create_release=False)   # defer release to end
+            result = run(image, create_release=False, internal_config=internal_config)
         except Exception as exc:
             logger.error(f"Unhandled error for {image}: {exc}", exc_info=True)
             result = {"status": "error", "final_image": image,
@@ -272,10 +251,24 @@ def run_discovery(args) -> int:
         tracker.record_result(state, image, digest, result)
         tracker.save_state(base_output, state)
 
-        if image in owned_images:
-            _maybe_harden(image, result, hardening_config, hardening_max_candidates, owned_images[image])
-
     _print_summary(results)
+
+    # Run-level two-section report (external vs internal) — one Claude call.
+    if results:
+        try:
+            from agent.reporter import generate_run_report
+            run_report = "# Run Summary — external & internal scopes\n\n" + generate_run_report(results)
+            (base_output / "run-summary.md").write_text(run_report)
+            logger.info(f"Run-level report saved → {base_output / 'run-summary.md'}")
+            # Also commit to the reports repo (REPORTS_REPO — no-op when unset):
+            # dated record + stable latest.md for browsing/diffing.
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            pub.push_report_to_repo(f"reports/run-summary/{date}.md", run_report,
+                                    f"vuln-agent: run summary ({date})")
+            pub.push_report_to_repo("reports/run-summary/latest.md", run_report,
+                                    f"vuln-agent: latest run summary ({date})")
+        except Exception as exc:
+            logger.warning(f"Run-level report generation failed: {exc}")
 
     # One combined GitHub Release with all image artifacts
     logger.info("Creating combined GitHub Release with all artifacts...")
@@ -285,7 +278,7 @@ def run_discovery(args) -> int:
     except Exception as exc:
         logger.warning(f"GitHub Release creation failed: {exc}")
 
-    any_clean = any(r.get("status") == "clean" for _, r in results)
+    any_clean = any(r.get("status") in ("clean", "golden_base_app") for _, r in results)
     return 0 if any_clean else 1
 
 

@@ -1,9 +1,3 @@
-# ── Stage 0: Build govulncheck from the official Go Docker image ─────────────
-# Using the golang image avoids downloading Go from go.dev inside the build.
-# CGO_ENABLED=0 produces a fully static binary that runs on any glibc host.
-FROM golang:1.25 AS gotools
-RUN CGO_ENABLED=0 go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
-
 # Download pre-built crane binary from GitHub releases (avoids Go module proxy instability)
 FROM debian:bookworm-slim AS crane-dl
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
@@ -52,10 +46,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy pre-built Python packages from deps stage
 COPY --from=deps /install /usr/local
 
-# Copy govulncheck static binary from gotools stage.
-# No Go toolchain needed at runtime — govulncheck's JSON output includes the
-# embedded Go version via the SBOM record, so `go version <binary>` is not used.
-COPY --from=gotools /go/bin/govulncheck /usr/local/bin/govulncheck
 COPY --from=crane-dl /usr/local/bin/crane /usr/local/bin/crane
 
 # Copy application source

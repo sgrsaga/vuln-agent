@@ -26,6 +26,15 @@ data:
   # Allow the tag-bump check to cross a major upstream version.
   ALLOW_MAJOR_TAG_BUMP: {{ .Values.scan.allowMajorTagBump | toString | quote }}
 
+  # Keep patched EXTERNAL images as <tag>-optimized-ext (team decision).
+  KEEP_EXTERNAL_IMAGES: {{ .Values.registry.keepExternalImages | toString | quote }}
+
+  # Internal images: loop budgets (dep-upgrade passes, LLM base rounds,
+  # global build/test/rescan cap).
+  DEP_UPGRADE_MAX_ITERATIONS: {{ .Values.scan.depUpgradeMaxIterations | toString | quote }}
+  LLM_BASE_MAX_ROUNDS: {{ .Values.scan.llmBaseMaxRounds | toString | quote }}
+  INTERNAL_MAX_ATTEMPTS: {{ .Values.scan.internalMaxAttempts | toString | quote }}
+
   # Base image hardening — only ever attempted for images matching this label
   # selector, with a matching entry in HARDENING_CONFIG. Empty selector or
   # empty config disables the feature entirely.
@@ -38,6 +47,13 @@ data:
 
   # GitHub repo for Release artifact publishing (owner/repo format).
   GITHUB_REPO: {{ .Values.github.repo | quote }}
+
+  # Reports repo — commit summary reports for browsing/diffing (empty disables).
+  REPORTS_REPO: {{ .Values.reports.repo | quote }}
+  REPORTS_BRANCH: {{ .Values.reports.branch | quote }}
+  # File code-fix suggestions as issues on the app's source repo when a
+  # balanced pick is non-deployable.
+  CODE_FIX_ISSUES: {{ .Values.reports.codeFixIssues | toString | quote }}
 
   # GitOps promotion PR-bot (higher environments). Empty repo disables it.
   GITOPS_REPO: {{ .Values.gitops.repo | quote }}

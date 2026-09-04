@@ -23,6 +23,8 @@ spec:
         app: vuln-agent
     spec:
       restartPolicy: Never
+      securityContext:
+        fsGroup: 999   # matches the "agent" GID in the container image (PVC write access)
 
       # Pull the vuln-agent image from GHCR
       imagePullSecrets:
@@ -65,8 +67,54 @@ spec:
             - name: GHCR_NAMESPACE
               value: "ghcr.io/sgrsaga"
 
+            # ── External-scope tuning ─────────────────────────────────────────
             - name: MAX_ITERATIONS
               value: "5"
+            # Allow the tag-bump check to cross a major upstream version.
+            - name: ALLOW_MAJOR_TAG_BUMP
+              value: "false"
+            # Keep patched EXTERNAL images as <tag>-optimized-ext (team decision).
+            - name: KEEP_EXTERNAL_IMAGES
+              value: "true"
+
+            # ── Internal-scope (owned image) opt-in ───────────────────────────
+            # Single-image mode has no pod labels to select on — set
+            # HARDEN_BASE_IMAGE=true AND give the image a HARDENING_CONFIG entry
+            # to run the rebuild-from-source pipeline instead of the external one.
+            - name: HARDEN_BASE_IMAGE
+              value: "false"
+            - name: HARDENING_CONFIG
+              value: "[]"            # e.g. [{"repo":"myapp","sourceRepo":"myorg/myapp","dockerfilePath":"Dockerfile","testStage":"test"}]
+            - name: HARDENING_MAX_CANDIDATES
+              value: "3"
+            - name: DEP_UPGRADE_MAX_ITERATIONS
+              value: "5"
+            - name: LLM_BASE_MAX_ROUNDS
+              value: "5"
+            - name: INTERNAL_MAX_ATTEMPTS
+              value: "20"
+
+            # ── Reports repo — human-readable system of record ────────────────
+            # Commits each summary report (dated + stable latest.md) so
+            # developers can browse/diff them. Empty repo disables.
+            - name: REPORTS_REPO
+              value: ""              # e.g. "myorg/security-reports"
+            - name: REPORTS_BRANCH
+              value: "main"
+            # REPORTS_TOKEN falls back to GITHUB_TOKEN when unset.
+            # File code-fix suggestions as issues on the app's source repo
+            # when a balanced pick is non-deployable.
+            - name: CODE_FIX_ISSUES
+              value: "true"
+
+            # ── GitOps promotion PR-bot (PPE/Prod) — empty repo disables ──────
+            - name: GITOPS_REPO
+              value: ""              # e.g. "myorg/gitops-ppe"
+            - name: GITOPS_BASE_BRANCH
+              value: "main"
+            - name: GITOPS_IMAGE_PATH_TEMPLATE
+              value: ""              # e.g. "environments/ppe/{repo_name}/values.yaml"
+            # GITOPS_TOKEN falls back to GITHUB_TOKEN when unset.
 
             - name: OUTPUT_DIR
               value: "/app/output"

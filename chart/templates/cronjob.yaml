@@ -81,6 +81,13 @@ spec:
                       key: {{ .Values.gitops.existingSecretKey }}
                       optional: true
 
+                - name: REPORTS_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.reports.existingSecret | default (include "vuln-agent.secretName" .) }}
+                      key: {{ .Values.reports.existingSecretKey }}
+                      optional: true
+
                 {{- with .Values.extraEnv }}
                 {{- toYaml . | nindent 16 }}
                 {{- end }}

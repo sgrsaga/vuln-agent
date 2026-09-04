@@ -46,11 +46,34 @@ def _image_user(image_ref: str) -> str:
         return ""
 
 
+def upgrade_lines(image_ref: str, families: list[str]) -> list[str]:
+    """
+    The USER/RUN Dockerfile lines that blanket-upgrade OS packages for the given
+    package-manager families, bracketed with USER root/<original> when image_ref's
+    actual config runs as non-root. Shared by generate_patch() (image-layer patch
+    for external images) and hardener's OS-patch rung (source-level patch for
+    internal images) — one source of truth for the upgrade idiom per family.
+    """
+    commands = [_UPGRADE_COMMANDS[f] for f in families if f in _UPGRADE_COMMANDS]
+    if not commands:
+        return []
+
+    user = _image_user(image_ref)
+    needs_root = bool(user) and user not in ("root", "0")
+
+    lines = []
+    if needs_root:
+        lines.append("USER root")
+    lines.extend(f"RUN {cmd}" for cmd in commands)
+    if needs_root:
+        lines.append(f"USER {user}")
+    return lines
+
+
 def generate_patch(
     current_image: str,
     iteration: int,
     vulnerabilities: list[dict],
-    go_analysis: dict | None = None,
 ) -> str | None:
     """
     Build a Dockerfile that upgrades OS/distro packages to their fixed versions.
@@ -70,17 +93,7 @@ def generate_patch(
         return None
 
     types_present = sorted({v["type"] for v in os_fixable})
-    commands = [_UPGRADE_COMMANDS[t] for t in types_present]
-
-    user = _image_user(current_image)
-    needs_root = bool(user) and user not in ("root", "0")
-
-    lines = [f"FROM {current_image}"]
-    if needs_root:
-        lines.append("USER root")
-    lines.extend(f"RUN {cmd}" for cmd in commands)
-    if needs_root:
-        lines.append(f"USER {user}")
+    lines = [f"FROM {current_image}"] + upgrade_lines(current_image, types_present)
 
     logger.info(
         f"Generated patch Dockerfile (iteration {iteration}, "

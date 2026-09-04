@@ -1,5 +1,8 @@
-# Periodic scanning CronJob — scans a fixed image on a schedule.
-# Each run is a fresh Job; results are uploaded to GitHub Releases.
+# Periodic scanning CronJob — discovers and scans every image running in the
+# cluster (same behavior as the Helm chart's CronJob). Each run is a fresh Job;
+# results are uploaded to GitHub Releases.
+#
+# Requires k8s/rbac.yaml (ServiceAccount + ClusterRole) for pod discovery.
 #
 # To trigger immediately without waiting for the schedule:
 #   kubectl -n security create job vuln-scan-manual \
@@ -29,6 +32,9 @@ spec:
             app: vuln-agent
         spec:
           restartPolicy: Never
+          serviceAccountName: vuln-agent   # see k8s/rbac.yaml — needed for --discover
+          securityContext:
+            fsGroup: 999   # matches the "agent" GID in the container image (PVC write access)
           imagePullSecrets:
             - name: ghcr-credentials
 
@@ -45,8 +51,9 @@ spec:
               image: ghcr.io/sgrsaga/vuln-agent:latest
               imagePullPolicy: Always
 
-              # ← Add all images to scan here; one arg = one image
-              args: ["ghcr.io/dexidp/dex:v2.45.1"]
+              # Discovery mode: scan everything running in the cluster.
+              # TARGET_NAMESPACES / EXCLUDED_NAMESPACES below control the scope.
+              args: ["--discover"]
 
               env:
                 - name: ANTHROPIC_API_KEY
@@ -63,8 +70,75 @@ spec:
                   value: "sgrsaga/vuln-agent"
                 - name: GHCR_NAMESPACE
                   value: "ghcr.io/sgrsaga"
+
+                # ── Discovery scope ─────────────────────────────────────────
+                # Whitelist (comma-separated). When non-empty, ONLY these are
+                # scanned and EXCLUDED_NAMESPACES is ignored.
+                - name: TARGET_NAMESPACES
+                  value: "argocd,monitoring"
+                # Blacklist — used only when TARGET_NAMESPACES is empty.
+                - name: EXCLUDED_NAMESPACES
+                  value: "kube-system,kube-public,kube-node-lease,security"
+                - name: INCLUDE_INIT_CONTAINERS
+                  value: "false"
+
+                # ── External-scope tuning ───────────────────────────────────
                 - name: MAX_ITERATIONS
                   value: "5"
+                # Allow the tag-bump check to cross a major upstream version.
+                - name: ALLOW_MAJOR_TAG_BUMP
+                  value: "false"
+                # Keep patched EXTERNAL images as <tag>-optimized-ext (team decision).
+                - name: KEEP_EXTERNAL_IMAGES
+                  value: "true"
+                # Rescan an unchanged image again after this many days (state on the output PVC).
+                - name: RESCAN_INTERVAL_DAYS
+                  value: "7"
+                - name: FORCE_RESCAN
+                  value: "false"
+
+                # ── Internal-scope (owned images) loop budgets ──────────────
+                - name: DEP_UPGRADE_MAX_ITERATIONS
+                  value: "5"
+                - name: LLM_BASE_MAX_ROUNDS
+                  value: "5"
+                - name: INTERNAL_MAX_ATTEMPTS
+                  value: "20"
+
+                # ── Base image hardening ────────────────────────────────────
+                # Only images whose pods match this label selector are ever
+                # treated as internal/owned. Empty selector disables hardening.
+                - name: OWNED_IMAGE_LABEL_SELECTOR
+                  value: ""              # e.g. "vuln-agent.io/harden=true"
+                # Central source/test config (JSON) for apps that haven't
+                # self-annotated (vuln-agent.io/source-repo etc.) yet.
+                - name: HARDENING_CONFIG
+                  value: "[]"            # e.g. [{"repo":"myapp","sourceRepo":"myorg/myapp","dockerfilePath":"Dockerfile","testStage":"test"}]
+                - name: HARDENING_MAX_CANDIDATES
+                  value: "3"
+
+                # ── Reports repo — human-readable system of record ──────────
+                # Commits each summary report (dated + stable latest.md) so
+                # developers can browse/diff them. Empty repo disables.
+                - name: REPORTS_REPO
+                  value: ""              # e.g. "myorg/security-reports"
+                - name: REPORTS_BRANCH
+                  value: "main"
+                # REPORTS_TOKEN falls back to GITHUB_TOKEN when unset.
+                # File code-fix suggestions as issues on the app's source repo
+                # when a balanced pick is non-deployable.
+                - name: CODE_FIX_ISSUES
+                  value: "true"
+
+                # ── GitOps promotion PR-bot (PPE/Prod) — empty repo disables ─
+                - name: GITOPS_REPO
+                  value: ""              # e.g. "myorg/gitops-ppe"
+                - name: GITOPS_BASE_BRANCH
+                  value: "main"
+                - name: GITOPS_IMAGE_PATH_TEMPLATE
+                  value: ""              # e.g. "environments/ppe/{repo_name}/values.yaml"
+                # GITOPS_TOKEN falls back to GITHUB_TOKEN when unset.
+
                 - name: OUTPUT_DIR
                   value: "/app/output"
                 - name: TRIVY_CACHE_DIR

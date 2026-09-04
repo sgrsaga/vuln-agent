@@ -1,0 +1,45 @@
+# ServiceAccount + cluster-read RBAC for discovery mode (--discover).
+# The CronJob (k8s/cronjob.yaml) references this ServiceAccount so the agent
+# can list pods and namespaces across the cluster to discover running images
+# and read the vuln-agent.io/* hardening annotations off owned pods.
+#
+# Apply before (or together with) k8s/cronjob.yaml:
+#   kubectl apply -f k8s/rbac.yaml
+#
+# Not needed for the one-shot single-image Job (k8s/job.yaml) — that mode
+# never talks to the Kubernetes API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vuln-agent
+  namespace: security
+  labels:
+    app: vuln-agent
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vuln-agent
+  labels:
+    app: vuln-agent
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vuln-agent
+  labels:
+    app: vuln-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vuln-agent
+subjects:
+  - kind: ServiceAccount
+    name: vuln-agent
+    namespace: security

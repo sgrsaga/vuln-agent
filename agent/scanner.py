@@ -26,6 +26,18 @@ def scan_image(image_ref: str) -> dict:
     return json.loads(result.stdout)
 
 
+def severity_key(vulns: list[dict]) -> tuple[int, int]:
+    """
+    Severity-ordered comparison key: (CRITICAL count, HIGH count). Lower is
+    better; an image with 0 critical / 8 high outranks 1 critical / 2 high —
+    matching how security teams actually triage, unlike a plain total count.
+    Used for every "improved?" / "least vulnerable" decision.
+    """
+    crit = sum(1 for v in vulns if v["severity"] == "CRITICAL")
+    high = sum(1 for v in vulns if v["severity"] == "HIGH")
+    return (crit, high)
+
+
 def extract_os_info(scan_data: dict) -> dict:
     """Pull the base OS family/version Trivy detected, e.g. {'family': 'debian', 'version': '11.3'}."""
     os_meta = (scan_data.get("Metadata") or {}).get("OS") or {}

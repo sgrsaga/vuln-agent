@@ -23,14 +23,30 @@ github:
   existingSecretKey: "github-token"
   repo: "sgrsaga/vuln-agent"
 
+# ── Reports repo — human-readable system of record ────────────────────────
+# When set, every summary report is ALSO committed to this repo
+# (reports/<repo>/<tag>/<date>-summary.md + stable latest.md, and
+# reports/run-summary/ for discovery runs) so developers can browse rendered
+# markdown, diff runs over time, and deep-link fixed paths. Release assets
+# remain the immutable audit archive. Empty repo disables.
+reports:
+  repo: "sgrsaga/reports"         # e.g. "myorg/security-reports"
+  branch: "main"
+  token: ""                       # falls back to github.token if unset
+  existingSecret: "github-token"
+  existingSecretKey: "reports-token"
+  # Non-deployable balanced picks: file the adjudication's code-fix
+  # suggestions as a GitHub Issue on the app's own source repo.
+  codeFixIssues: true
+
 # ── GitOps promotion PR-bot (higher environments — PPE/Prod) ──────────────
 # Opens a reviewable PR against a separate GitOps manifests repo bumping the
 # optimized image reference. Leave repo empty to disable — lower environments
 # should use ArgoCD Image Updater instead (see README, no config here).
 gitops:
-  repo: ""                        # owner/repo of the GitOps manifests repo
+  repo: "sgrsaga/reports"         # owner/repo of the GitOps manifests repo
   token: ""                       # falls back to github.token if unset
-  existingSecret: ""
+  existingSecret: "github-token"
   existingSecretKey: "gitops-token"
   baseBranch: "main"
   imagePathTemplate: ""           # e.g. "environments/ppe/{repo_name}/values.yaml"
@@ -41,6 +57,12 @@ registry:
   server: "ghcr.io"
   username: ""
   password: ""
+  # Keep patched EXTERNAL (third-party) images as <tag>-optimized-ext?
+  # Keeping copies of third-party images is generally discouraged (upstream
+  # ships the real fix eventually) but it's the team's call — default true.
+  # Internal images (-golden-base-app / -optimized-app, plus the standalone
+  # -golden-base / -optimized-base artifacts) are always kept regardless.
+  keepExternalImages: true
   existingSecret: "vuln-agent-registry"
 
 # ── Image discovery ────────────────────────────────────────────────────────
@@ -50,8 +72,8 @@ discovery:
   # The agent's release namespace is never included even if listed here.
   # Leave empty ([]) to fall back to the excludedNamespaces blacklist.
   targetNamespaces:
-    - argocd
     - monitoring
+    - apps
 
   # EXCLUDED NAMESPACES (blacklist — used only when targetNamespaces is empty)
   # The agent's own release namespace is always appended automatically.
@@ -83,6 +105,14 @@ scan:
   # default — a major bump can change app behavior, so crossing one shouldn't
   # happen silently in an automated remediation loop.
   allowMajorTagBump: false
+  # Internal images: max dependency-upgrade rebuild/test/rescan passes after
+  # the base-image ladder.
+  depUpgradeMaxIterations: 5
+  # Internal images: max LLM base-determination rounds (outer ladder loop).
+  llmBaseMaxRounds: 5
+  # Internal images: global cap on build/test/rescan cycles per image — the
+  # nested loops above are individually bounded, this bounds their product.
+  internalMaxAttempts: 20
 
 # ── Base image hardening ("golden image" generation) ───────────────────────
 # Only ever attempted for images matching discovery.ownedImageLabelSelector

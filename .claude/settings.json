@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile agent/hardener.py)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/home/ubuntu/vuln-agent/agent/orchestrator.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -m py_compile agent/orchestrator.py)",
+      "Bash(python3 -m py_compile agent/reporter.py)"
+    ]
+  }
+}

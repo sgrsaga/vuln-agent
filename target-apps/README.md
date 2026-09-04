@@ -88,7 +88,7 @@ hardening:
 
 | Directory | Runtime | Base image | Test command |
 |---|---|---|---|
-| `python-app/` | Flask API (`/health`, `/fib/<n>`) | `python:3.9-slim` | `pytest` |
+| `python-app/` | Flask API (`/health`, `/fib/<n>`) — deliberately pins old `flask==2.2.2`/`werkzeug==2.2.2` (known CVEs) so the dependency-upgrade loop has something real to fix | `python:3.9-slim` | `pytest` |
 | `go-app/` | `net/http` server (`/health`) | `golang:1.21-alpine` | `go vet ./... && go test ./...` |
 | `java-app/` | `com.sun.net.httpserver` server (`/health`), Maven | `eclipse-temurin:17-jdk-alpine` | `mvn test` |
 | `nodejs-app/` | `node:http` server (`/health`) | `node:18-slim` | `node --test` (built-in test runner) |

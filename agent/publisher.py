@@ -11,8 +11,15 @@ Outside GitHub Actions / in k8s:
   - A GitHub Release is created via the REST API at the end of the run;
     all output files are attached as release assets (no gh CLI required).
   - Progress is printed to stdout.
+
+Reports repo (optional, REPORTS_REPO): the Release is the immutable audit
+archive, but release assets are a poor reading room — no rendering, diffing, or
+stable URLs. When REPORTS_REPO is set, every summary report is ALSO committed
+to that repo (dated file + a stable latest.md per image) so developers can
+browse rendered markdown, diff runs over time, and deep-link a fixed path.
 """
 
+import base64
 import json
 import logging
 import mimetypes
@@ -129,51 +136,92 @@ def publish_scan(
             _md(f"| **{v['severity']}** | `{v['id']}` | `{v['package']}` | {v['installed']} | {fix} |")
 
 
-def publish_summary(image_ref: str, final_image: str, status: str, content: str) -> None:
-    """Persist the one before/after summary report for the whole run."""
+def publish_summary(image_ref: str, final_image: str, status: str, content: str) -> str:
+    """
+    Persist the one before/after summary report for the whole run.
+    Returns the full composed markdown so callers can republish it elsewhere
+    (reports repo, promotion PR body) without rebuilding the header.
+    """
     out = get_output_dir()
     out.mkdir(parents=True, exist_ok=True)
-    path = out / "summary-report.md"
-    path.write_text(
+    full = (
         f"# Remediation Summary\n\n"
         f"> Original image: `{image_ref}`\n"
         f"> Final image: `{final_image}`\n"
         f"> Status: `{status}`\n\n{content}"
     )
+    path = out / "summary-report.md"
+    path.write_text(full)
     logger.info(f"Summary report saved → {path}")
     _md(f"\n<details><summary>📋 Remediation Summary</summary>\n\n{content}\n\n</details>\n")
+    return full
+
+
+def push_report_to_repo(rel_path: str, content: str, message: str) -> str | None:
+    """
+    Commit one markdown report into the reports repo (REPORTS_REPO, on
+    REPORTS_BRANCH — default "main") at rel_path, creating or updating the file
+    via the GitHub Contents API. This is the system-of-record path for humans:
+    rendered, diffable, and stable-URL-addressable, unlike release assets.
+
+    No-ops (returning None) when REPORTS_REPO is unset. Returns the file's
+    html_url on success. REPORTS_TOKEN falls back to GITHUB_TOKEN.
+    """
+    repo = _normalize_repo(os.environ.get("REPORTS_REPO", ""))
+    if not repo:
+        return None
+    token = os.environ.get("REPORTS_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        logger.info("REPORTS_REPO set but no REPORTS_TOKEN/GITHUB_TOKEN — skipping report push")
+        return None
+    branch = os.environ.get("REPORTS_BRANCH", "main")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        with httpx.Client(base_url=_GH_API, headers=headers, timeout=30.0) as client:
+            existing = client.get(f"/repos/{repo}/contents/{rel_path}", params={"ref": branch})
+            payload = {
+                "message": message,
+                "content": base64.b64encode(content.encode()).decode(),
+                "branch": branch,
+            }
+            if existing.status_code == 200:
+                payload["sha"] = existing.json()["sha"]
+            resp = client.put(f"/repos/{repo}/contents/{rel_path}", json=payload)
+            if resp.status_code not in (200, 201):
+                logger.warning(f"Report push to {repo}/{rel_path} failed: "
+                               f"{resp.status_code} {resp.text[:300]}")
+                return None
+            url = (resp.json().get("content") or {}).get("html_url")
+            logger.info(f"Report committed → {url or f'{repo}/{rel_path}'}")
+            return url
+    except Exception as exc:
+        logger.warning(f"Report push to {repo}/{rel_path} failed: {exc}")
+        return None
+
+
+def push_summary_reports(repo_name: str, tag: str, full_report: str) -> str | None:
+    """
+    Commit an image's summary report twice: a dated record
+    (reports/<repo>/<tag>/<YYYY-MM-DD>-summary.md — one per day, later runs the
+    same day overwrite) and the stable reports/<repo>/<tag>/latest.md that docs
+    and dashboards can deep-link. Returns latest.md's html_url (or None).
+    """
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    base = f"reports/{repo_name}/{tag}"
+    push_report_to_repo(f"{base}/{date}-summary.md", full_report,
+                        f"vuln-agent: {repo_name}:{tag} summary ({date})")
+    return push_report_to_repo(f"{base}/latest.md", full_report,
+                               f"vuln-agent: {repo_name}:{tag} latest summary ({date})")
 
 
 def publish_event(event_type: str, message: str, data: dict | None = None) -> None:
     _log(event_type, message, data)
     _md(f"\n> {message}\n")
-
-
-def publish_go_analysis(image_ref: str, iteration: int, go_analysis: dict) -> None:
-    """
-    Log govulncheck classification results to the live GitHub Step Summary.
-    Not persisted as a standalone artifact — this content is folded into the
-    one final summary-report.md instead (see reporter.generate_summary_report).
-    """
-    s = {
-        "false_positives": len(go_analysis.get("false_positives", [])),
-        "unexploitable": len(go_analysis.get("unexploitable", [])),
-        "confirmed": len(go_analysis.get("confirmed", [])),
-        "skipped": len(go_analysis.get("skipped", [])),
-    }
-    _md(f"\n### 🔬 Go Binary Analysis — Iteration {iteration}\n")
-    _md(
-        f"| Classification | Count | Meaning |\n"
-        f"|----------------|-------|---------|\n"
-        f"| False positive | {s['false_positives']} | Built with fixed toolchain — suppress in scanner |\n"
-        f"| Unexploitable  | {s['unexploitable']} | Symbol present but not reachable — risk-accept |\n"
-        f"| Confirmed      | {s['confirmed']} | Reachable — requires source rebuild |\n"
-        f"| Skipped        | {s['skipped']} | Binary not extractable / tools unavailable |\n"
-    )
-    if go_analysis.get("false_positives"):
-        _md("\n**False positives (suppress these in your scanner policy):**\n")
-        for v in go_analysis["false_positives"]:
-            _md(f"- `{v['id']}` in `{v['package']}` — {v['analysis']['reason']}")
 
 
 def create_github_release(base_dir: Path | None = None, tag: str | None = None) -> None:
@@ -226,9 +274,14 @@ def create_github_release(base_dir: Path | None = None, tag: str | None = None) 
                     "## Automated vulnerability remediation results\n\n"
                     "### Attached artifacts\n"
                     "- `<image>--scan-baseline.json` — Trivy JSON from the first scan, before any changes\n"
-                    "- `<image>--summary-report.md` — Claude Opus 4.8 before/after remediation summary\n\n"
-                    "The final image (if any changes were made) is tagged `<original-tag>-optimized` "
-                    "in the registry — see the summary report for its exact reference.\n"
+                    "- `<image>--summary-report.md` — Claude Opus 4.8 before/after remediation summary\n"
+                    "- `run-summary.md` — discovery mode only: run-level report "
+                    "(External + Internal sections across every image this run)\n\n"
+                    "The final image (if any changes were made) is tagged "
+                    "`<original-tag>-optimized-ext` (external), or `-golden-base-app` / "
+                    "`-optimized-app` (internal, plus the winning base standalone as "
+                    "`-golden-base`/`-optimized-base`) — see the summary report for the "
+                    "exact reference.\n"
                 ),
                 "draft": False,
                 "prerelease": True,

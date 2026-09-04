@@ -2,7 +2,7 @@
 Finds a newer upstream tag of the current image that already fixes CVEs, so the
 orchestrator can adopt it directly instead of layering an OS-package patch.
 
-Uses crane (already a dependency, already used daemon-less in go_analyzer.py) to
+Uses crane (already a dependency, daemon-less) to
 list tags directly from the registry — no docker daemon required.
 
 Only strict numeric version tags are considered (optionally `v`-prefixed,
