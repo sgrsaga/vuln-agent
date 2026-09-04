@@ -38,6 +38,39 @@ spec:
                 - name: trivy-cache
                   mountPath: /trivy-cache
 
+            {{- if .Values.docker.dind.enabled }}
+            # ── Docker-in-Docker NATIVE SIDECAR (restartPolicy: Always) ─────
+            # Portable build support for containerd clusters (no Docker on the
+            # nodes, no hostPath). Runs dockerd inside the pod; the agent's
+            # docker CLI and Trivy reach it over the default unix socket on
+            # the shared /var/run emptyDir. A native sidecar (k8s >= 1.28)
+            # terminates automatically when the main container finishes, so
+            # the CronJob's Job still completes. Trade-offs: privileged: true
+            # (daemon needs it), and the layer cache resets every run
+            # (docker-graph is an emptyDir).
+            - name: dind
+              image: {{ .Values.docker.dind.image }}
+              restartPolicy: Always
+              securityContext:
+                privileged: true
+              env:
+                - name: DOCKER_TLS_CERTDIR
+                  value: ""          # unix socket only — no TCP, no TLS bootstrap
+              volumeMounts:
+                - name: docker-run
+                  mountPath: /var/run
+                - name: docker-graph
+                  mountPath: /var/lib/docker
+              # Gate the main container on the daemon actually being up.
+              startupProbe:
+                exec:
+                  command: ["test", "-S", "/var/run/docker.sock"]
+                periodSeconds: 2
+                failureThreshold: 30
+              resources:
+                {{- toYaml .Values.docker.dind.resources | nindent 16 }}
+            {{- end }}
+
           containers:
             - name: vuln-agent
               image: {{ include "vuln-agent.image" . }}
@@ -102,9 +135,17 @@ spec:
                 - name: trivy-cache
                   mountPath: /trivy-cache
 
-                {{- if .Values.docker.hostSocketPath }}
-                - name: docker-socket
-                  mountPath: /var/run/docker.sock
+                {{- if .Values.docker.dind.enabled }}
+                # Shared with the dind sidecar — the docker socket lives here.
+                # The projected SA token at /var/run/secrets/... is its own
+                # deeper mount, so it is not shadowed by this one.
+                - name: docker-run
+                  mountPath: /var/run
+                # Registry credentials for docker push / crane copy — dind
+                # starts with an empty credential store every run.
+                - name: docker-config
+                  mountPath: /home/agent/.docker
+                  readOnly: true
                 {{- end }}
 
               resources:
@@ -120,11 +161,18 @@ spec:
               persistentVolumeClaim:
                 claimName: {{ printf "%s-trivy-cache" (include "vuln-agent.fullname" .) }}
 
-            {{- if .Values.docker.hostSocketPath }}
-            - name: docker-socket
-              hostPath:
-                path: {{ .Values.docker.hostSocketPath }}
-                type: Socket
+            {{- if .Values.docker.dind.enabled }}
+            - name: docker-run
+              emptyDir: {}
+            - name: docker-graph
+              emptyDir:
+                sizeLimit: {{ .Values.docker.dind.storageSize }}
+            - name: docker-config
+              secret:
+                secretName: {{ include "vuln-agent.registrySecretName" . }}
+                items:
+                  - key: .dockerconfigjson
+                    path: config.json
             {{- end }}
 
           {{- with .Values.nodeSelector }}

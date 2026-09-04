@@ -306,10 +306,15 @@ again.
 from GitHub releases rather than via `go install`, to avoid Go proxy flakiness) is
 used for every daemon-less registry operation: tag listing, digest resolution,
 and tag-bump promotion. `docker` is used only for building and pushing
-OS-layer patches, and requires a real daemon — in k8s that means mounting the host's
-`/var/run/docker.sock`, which is why `chart/values.yaml`'s `docker.hostSocketPath`
-defaults empty (analysis-only mode: scan, classify, generate reports/Dockerfiles,
-skip build+push) rather than assuming socket access is available.
+OS-layer patches, and requires a real daemon — in the chart that's a
+Docker-in-Docker NATIVE sidecar (`docker.dind.enabled`, k8s ≥ 1.28: a
+privileged `docker:dind` initContainer with `restartPolicy: Always` sharing an
+emptyDir at `/var/run`, startup-probed on the socket so the agent never races
+it, layer cache reset per run, registry creds mounted from the
+`vuln-agent-registry` secret since dind starts credential-less) — portable to
+containerd nodes that have no Docker daemon at all, unlike the legacy
+`k8s/*.yaml` path's hostPath socket mount. `dind.enabled: false` = analysis-only
+mode (scan, classify, generate reports/Dockerfiles, skip build+push).
 
 Note: `main.py: _check_deps()` currently requires `docker` on PATH unconditionally,
 even though the orchestrator has a documented no-Docker analysis-only path
@@ -328,7 +333,7 @@ you're debugging why analysis-only mode isn't reachable from the CLI.
   developed path per git history: SealedSecrets for credentials
   (`chart/sealed-secrets.yaml`, applied separately before `helm upgrade --install`),
   a `discovery.targetNamespaces`/`excludedNamespaces` whitelist-first model, and
-  `docker.hostSocketPath` opt-in (empty by default → analysis-only mode).
+  `docker.dind` sidecar opt-in (disabled → analysis-only mode).
 
   Check git history / ask before assuming which path a given k8s change should
   target — they are not kept in sync automatically.

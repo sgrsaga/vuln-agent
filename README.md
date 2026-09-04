@@ -443,8 +443,11 @@ discovery:
   ownedImageLabelSelector: "vuln-agent.io/harden=true"  # enables internal hardening
 
 docker:
-  hostSocketPath: "/var/run/docker.sock"  # REQUIRED for builds — empty = analysis-only
-                                          # mode (scan + classify + reports, no build/push)
+  dind:
+    enabled: true    # REQUIRED for builds — runs dockerd as a privileged native
+                     # sidecar in the pod (portable: works on containerd nodes
+                     # with no Docker daemon). false = analysis-only mode
+                     # (scan + classify + reports, no build/push)
 
 persistence:
   output:      { storageClass: "your-storageclass" }

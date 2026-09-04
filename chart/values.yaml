@@ -180,13 +180,29 @@ rbac:
   create: true
 
 # ── Docker (optional — required only for building patched images) ──────────
-# When Docker is unavailable (e.g. k8s pod without socket access), the agent
-# runs in analysis-only mode: it scans, classifies, and generates Dockerfiles
-# but skips the build+push step.
+# When no Docker daemon is available, the agent runs in analysis-only mode:
+# it scans, classifies, and generates Dockerfiles but skips build+push.
 docker:
-  # Set to the host Docker socket path to enable building in k8s (optional).
-  # Leave empty to run in analysis-only mode (safe default for most clusters).
-  hostSocketPath: "/var/run/docker.sock"
+  # Docker-in-Docker sidecar — the portable way to enable builds on modern
+  # (containerd) clusters whose nodes have no Docker daemon or socket at all.
+  # Runs dockerd as a privileged NATIVE sidecar in the agent pod, sharing the
+  # socket over an in-pod emptyDir at /var/run; no hostPath, no node changes.
+  # Trade-offs: the dind container runs privileged: true, and the image layer
+  # cache resets every run (emptyDir). Requires Kubernetes >= 1.28.
+  # enabled: false = analysis-only mode.
+  dind:
+    enabled: true
+    image: "docker:27-dind"
+    # emptyDir cap for /var/lib/docker — pulled bases + built candidates for
+    # one run must fit here.
+    storageSize: 20Gi
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "256Mi"
+      limits:
+        cpu: "2"
+        memory: "2Gi"
 
 # ── Trivy init container ───────────────────────────────────────────────────
 trivy:
