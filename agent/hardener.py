@@ -523,13 +523,22 @@ def remediate_internal(
             logger.warning(str(exc))
             return no_change
 
-        df_path = os.path.join(repo_dir, dockerfile_path)
+        # The app root is the directory holding the Dockerfile — the repo root
+        # for a single-app repo, or a subdirectory when dockerfile-path points
+        # into a monorepo (e.g. "python-app/Dockerfile"). Build context, test
+        # runs, and dependency-manifest edits all happen there.
+        df_path = os.path.normpath(os.path.join(repo_dir, dockerfile_path))
+        app_dir = os.path.dirname(df_path)
+        if not (app_dir == repo_dir or app_dir.startswith(repo_dir + os.sep)):
+            logger.warning(f"dockerfilePath {dockerfile_path!r} escapes the clone for "
+                           f"{repo_name} — cannot remediate")
+            return no_change
         original_base = _current_base(df_path)
         if original_base is None:
             logger.warning(f"No FROM line in {dockerfile_path} for {repo_name} — cannot remediate")
             return no_change
 
-        code_ctx = _code_context(repo_dir, dockerfile_path)
+        code_ctx = _code_context(app_dir, os.path.basename(df_path))
         tried_bases: set[str] = {original_base}
 
         def budget_left() -> bool:
@@ -540,7 +549,7 @@ def remediate_internal(
             nonlocal best_tag, best_vulns, best_key, attempt_n
             attempt_n += 1
             tag = f"vuln-agent-harden/{repo_name}:{attempt_n}"
-            r = _build_test_scan(repo_dir, tag, test_stage, test_command, best_key)
+            r = _build_test_scan(app_dir, tag, test_stage, test_command, best_key)
             states.append({"step": step, "detail": detail, **r})
             if r["improved"]:
                 best_tag, best_vulns, best_key = tag, r["vulns"], severity_key(r["vulns"])
@@ -569,7 +578,7 @@ def remediate_internal(
                     break
                 candidate = f"{base_split[0]}:{t['tag']}"
                 tried_bases.add(candidate)
-                snap = _snapshot(repo_dir, df_path)
+                snap = _snapshot(app_dir, df_path)
                 _patch_dockerfile_base(df_path, candidate)
                 if not attempt("base-tag-bump", candidate):
                     _restore(snap)
@@ -583,7 +592,7 @@ def remediate_internal(
                 upgrade = patcher.upgrade_lines(_current_base(df_path), [family])
                 if not upgrade:
                     break
-                snap = _snapshot(repo_dir, df_path)
+                snap = _snapshot(app_dir, df_path)
                 if not _inject_os_upgrade(df_path, upgrade):
                     break
                 if not attempt("os-patch", f"{family} blanket upgrade in base stage"):
@@ -607,7 +616,7 @@ def remediate_internal(
                 if not budget_left():
                     break
                 tried_bases.add(candidate)
-                snap = _snapshot(repo_dir, df_path)
+                snap = _snapshot(app_dir, df_path)
                 _strip_injected_upgrade(df_path)  # other family's upgrade breaks a new base
                 _patch_dockerfile_base(df_path, candidate)
                 if attempt("llm-base", candidate):
@@ -632,8 +641,8 @@ def remediate_internal(
             delta = [v for v in best_vulns if v["id"] not in base_ids]
             if not delta:
                 break
-            snap = _snapshot(repo_dir, df_path)
-            bumps = dep_upgrader.apply(repo_dir, delta, _current_base(df_path))
+            snap = _snapshot(app_dir, df_path)
+            bumps = dep_upgrader.apply(app_dir, delta, _current_base(df_path))
             if not bumps:
                 break
             if not attempt(f"dep-bump#{i + 1}", ", ".join(bumps)):

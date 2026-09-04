@@ -5,20 +5,22 @@ Manifests for running all five target apps in the `apps` namespace as
 picks them up and takes them through the full internal pipeline (base ladder →
 standalone base artifact → dependency loop → golden/optimized outcome).
 
-## Why each app needs its own GitHub repo
+## One monorepo for all apps
 
+All five apps live in a single GitHub repo (`sgrsaga/target-apps` by default).
 The hardening pipeline clones `vuln-agent.io/source-repo` and **builds the
-clone root**: the Dockerfile, and the dependency manifests the dep loop edits
-(`requirements.txt`, `package.json`, `go.mod`, `pom.xml`), must sit at the
-repo's top level. Pointing `source-repo` at this monorepo with a
-`target-apps/<app>/...` dockerfile-path will not build. `publish-apps.sh`
-splits each app directory into its own repo and pushes its image in one step.
+directory that holds `vuln-agent.io/dockerfile-path`**: with
+`dockerfile-path: python-app/Dockerfile` the agent uses `python-app/` inside
+the clone as the build context, and the dependency manifests the dep loop
+edits (`requirements.txt`, `package.json`, `go.mod`, `pom.xml`) are looked up
+there too. `publish-apps.sh` pushes the whole target-apps tree into that one
+repo and builds/pushes each app's image from its subdirectory in one step.
 
 ## Setup
 
 ```bash
-# 1. Publish per-app repos + images (idempotent; re-run after editing an app)
-GITHUB_TOKEN=ghp_... ./publish-apps.sh sgrsaga v1
+# 1. Publish the monorepo + per-app images (idempotent; re-run after editing an app)
+GITHUB_TOKEN=ghp_... ./publish-apps.sh sgrsaga v1 target-apps
 
 # 2. Namespace + pull secret
 kubectl apply -f namespace.yaml

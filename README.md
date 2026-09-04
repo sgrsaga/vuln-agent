@@ -636,10 +636,14 @@ Two things both have to be true:
        vuln-agent.io/harden: "true"
      annotations:
        vuln-agent.io/source-repo: myorg/myapp
-       vuln-agent.io/dockerfile-path: Dockerfile
+       vuln-agent.io/dockerfile-path: Dockerfile   # monorepo? point into it: myapp/Dockerfile
        vuln-agent.io/test-stage: test
        # vuln-agent.io/test-command: pytest   # fallback if there's no dedicated test stage
    ```
+
+   `dockerfile-path` is relative to the clone root, and the agent builds the
+   Dockerfile's directory as the context — so the app can be the whole repo or
+   one subdirectory of a monorepo.
 
    **Central — `hardening.images` in `chart/values.yaml`**, keyed by bare image
    repo name (useful for apps that haven't added annotations yet, or as a

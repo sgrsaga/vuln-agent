@@ -7,8 +7,8 @@
 # is, and which build stage is the test gate. No central HARDENING_CONFIG
 # entry needed.
 #
-# PREREQUISITE: the agent clones source-repo and builds from its ROOT, so this
-# app must live in its own GitHub repo (Dockerfile at the top level) — see
+# PREREQUISITE: the agent clones source-repo and builds the directory holding
+# dockerfile-path, so all apps live together in the target-apps monorepo — see
 # target-apps/k8s/README.md for the publish script that sets that up.
 apiVersion: apps/v1
 kind: Deployment
@@ -29,8 +29,8 @@ spec:
         app: python-app
         vuln-agent.io/harden: "true"
       annotations:
-        vuln-agent.io/source-repo: "sgrsaga/python-app"
-        vuln-agent.io/dockerfile-path: "Dockerfile"
+        vuln-agent.io/source-repo: "sgrsaga/target-apps"
+        vuln-agent.io/dockerfile-path: "python-app/Dockerfile"
         vuln-agent.io/test-stage: "test"
     spec:
       imagePullSecrets:

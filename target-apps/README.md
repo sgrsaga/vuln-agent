@@ -58,8 +58,11 @@ toolchain *onto that same minimal base* (e.g. `RUN apk add --no-cache go`) so
 ## Onboarding one of these (or a real app) for hardening
 
 Two equivalent ways — see `README.md`'s "Base image hardening" section for
-the full picture. Using `python-app` as the example, assuming it lived at
-`ghcr.io/myorg/python-app:v1.0.0`:
+the full picture. `dockerfile-path` is relative to the clone root, and the
+agent uses the Dockerfile's directory as the build context — so an app can be
+a subdirectory of a monorepo (as all of these apps are, in `myorg/target-apps`)
+or a repo of its own (`dockerfile-path: Dockerfile`). Using `python-app` as
+the example, assuming its image lived at `ghcr.io/myorg/python-app:v1.0.0`:
 
 **Self-service, on the app's own Deployment** (no separate file to touch):
 ```yaml
@@ -67,8 +70,8 @@ metadata:
   labels:
     vuln-agent.io/harden: "true"
   annotations:
-    vuln-agent.io/source-repo: myorg/python-app
-    vuln-agent.io/dockerfile-path: Dockerfile
+    vuln-agent.io/source-repo: myorg/target-apps
+    vuln-agent.io/dockerfile-path: python-app/Dockerfile
     vuln-agent.io/test-stage: test
 ```
 
@@ -79,8 +82,8 @@ discovery:
 hardening:
   images:
     - repo: python-app
-      sourceRepo: myorg/python-app
-      dockerfilePath: Dockerfile
+      sourceRepo: myorg/target-apps
+      dockerfilePath: python-app/Dockerfile
       testStage: test
 ```
 

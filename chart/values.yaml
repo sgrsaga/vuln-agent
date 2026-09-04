@@ -130,7 +130,8 @@ hardening:
   images: []
   # - repo: myapp                    # bare image repo name (no registry/tag)
   #   sourceRepo: myorg/myapp        # owner/repo to clone
-  #   dockerfilePath: Dockerfile
+  #   dockerfilePath: Dockerfile     # relative to the clone root; its directory is the
+  #                                  # build context, so a monorepo subdir (myapp/Dockerfile) works
   #   # Only the base of the stage that becomes the FINAL built image gets
   #   # swapped (a plain `docker build` output — a builder stage's own base,
   #   # e.g. golang/node, is never touched, since it's discarded before the
