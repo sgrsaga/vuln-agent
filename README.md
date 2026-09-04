@@ -339,6 +339,14 @@ Example output for `ghcr.io/dexidp/dex:v2.45.1`:
 
 The agent runs as a Kubernetes **Job** (one-shot on demand) or **CronJob** (automated schedule). It mounts the node's Docker socket to build and push images without needing a Docker daemon inside the pod.
 
+Two deployment paths, pick one:
+
+- **Option A — Helm chart (`chart/`, recommended)**: the actively-developed
+  path — discovery mode, SealedSecrets, whitelist namespace model, all
+  parameters in one `values.yaml`.
+- **Option B — raw manifests (`k8s/`)**: step-by-step `kubectl apply`, useful
+  when Helm isn't available or you want to see every moving part.
+
 ### Cluster architecture
 
 ```
@@ -367,7 +375,123 @@ The agent runs as a Kubernetes **Job** (one-shot on demand) or **CronJob** (auto
           └──► GitHub Releases API (artifacts uploaded at end of run)
 ```
 
-### Step 1 — Build and push the agent image
+### Option A — Helm chart (recommended)
+
+#### A1 — Build and push the agent image
+
+```bash
+docker build -t ghcr.io/your-org/vuln-agent:latest .
+docker push ghcr.io/your-org/vuln-agent:latest
+```
+
+Set the reference in `chart/values.yaml` under `image:` — pin by `digest` (as
+the checked-in values do) or by `tag`.
+
+#### A2 — Credentials
+
+The chart expects two secrets in the release namespace:
+
+- `vuln-agent-secrets` — keys `anthropic-api-key` and `github-token`
+- `vuln-agent-registry` — a `kubernetes.io/dockerconfigjson` secret for
+  pulling the agent image and pushing remediated images
+
+**With SealedSecrets** (how this repo manages them —
+`chart/sealed-secrets.yaml` holds both, encrypted for the cluster's
+controller):
+
+```bash
+kubectl create namespace vuln-agent   # SealedSecrets are namespace-bound — this must match
+kubectl apply -f chart/sealed-secrets.yaml
+```
+
+To re-seal for your own cluster/namespace, follow the `kubeseal` commands in
+the header of `chart/sealed-secrets.yaml`.
+
+**Without SealedSecrets** (quick start), create them directly:
+
+```bash
+kubectl create namespace vuln-agent
+kubectl -n vuln-agent create secret generic vuln-agent-secrets \
+  --from-literal=anthropic-api-key=sk-ant-... \
+  --from-literal=github-token=ghp_...
+kubectl -n vuln-agent create secret docker-registry vuln-agent-registry \
+  --docker-server=ghcr.io \
+  --docker-username=YOUR_GITHUB_USERNAME \
+  --docker-password=ghp_...
+```
+
+(Alternatively pass `anthropic.apiKey`/`github.token`/`registry.username`+
+`registry.password` as values and the chart renders the secrets itself —
+convenient, but the credentials then live in your values file.)
+
+#### A3 — Configure `chart/values.yaml`
+
+The key decisions (everything else has sane defaults):
+
+```yaml
+image:
+  repository: ghcr.io/your-org/vuln-agent   # from A1
+
+registry:
+  namespace: "ghcr.io/your-org"    # where remediated images get pushed
+
+github:
+  repo: "your-org/your-repo"       # GitHub Releases land here
+
+discovery:
+  targetNamespaces: [apps, monitoring]   # whitelist of namespaces to scan
+  ownedImageLabelSelector: "vuln-agent.io/harden=true"  # enables internal hardening
+
+docker:
+  hostSocketPath: "/var/run/docker.sock"  # REQUIRED for builds — empty = analysis-only
+                                          # mode (scan + classify + reports, no build/push)
+
+persistence:
+  output:      { storageClass: "your-storageclass" }
+  trivyCache:  { storageClass: "your-storageclass" }
+
+reports:
+  repo: "your-org/security-reports"  # optional: commit reports for browsing/diffing
+
+schedule: "0 2 * * *"                # discovery CronJob cadence
+```
+
+#### A4 — Install
+
+```bash
+helm lint chart/
+helm upgrade --install vuln-agent chart/ -n vuln-agent --create-namespace -f chart/values.yaml
+```
+
+The release's NOTES print the trigger/log/artifact commands. RBAC
+(ServiceAccount + cluster pod-read for discovery), PVCs, ConfigMap, and the
+discovery-mode CronJob are all created by the chart.
+
+#### A5 — Trigger a run now (instead of waiting for the schedule)
+
+```bash
+kubectl -n vuln-agent create job vuln-scan-manual --from=cronjob/vuln-agent
+kubectl -n vuln-agent logs -f job/vuln-scan-manual
+```
+
+#### A6 — Results, upgrades, removal
+
+```bash
+# Artifacts: output PVC (scan-baseline.json + summary-report.md per image,
+# run-summary.md per run), the GitHub Release, and — when reports.repo is
+# set — rendered markdown committed to that repo.
+
+# Apply a values change / new chart version
+helm upgrade vuln-agent chart/ -n vuln-agent -f chart/values.yaml
+
+# Remove (PVCs are kept by Helm — delete them explicitly if you want the
+# scan state and artifacts gone too)
+helm uninstall vuln-agent -n vuln-agent
+```
+
+### Option B — raw manifests (`k8s/`)
+
+#### Step 1 — Build and push the agent image
 
 ```bash
 # Build
@@ -377,7 +501,7 @@ docker build -t ghcr.io/your-org/vuln-agent:latest .
 docker push ghcr.io/your-org/vuln-agent:latest
 ```
 
-### Step 2 — Create namespace, persistent storage, and RBAC
+#### Step 2 — Create namespace, persistent storage, and RBAC
 
 ```bash
 kubectl apply -f k8s/namespace.yaml
@@ -389,7 +513,7 @@ Two PVCs are created:
 - `vuln-agent-output` (1 Gi) — scan JSON, reports, Dockerfiles
 - `vuln-agent-trivy-cache` (2 Gi) — Trivy vulnerability DB (avoids re-downloading on every run)
 
-### Step 3 — Create secrets
+#### Step 3 — Create secrets
 
 ```bash
 # Anthropic API key + GitHub token
@@ -406,7 +530,7 @@ kubectl -n security create secret docker-registry ghcr-credentials \
 
 For other registries replace `--docker-server` with your registry hostname (e.g. `123456789.dkr.ecr.us-east-1.amazonaws.com`).
 
-### Step 4 — Configure the manifests
+#### Step 4 — Configure the manifests
 
 Edit `k8s/job.yaml` (and `k8s/cronjob.yaml` if using scheduled scans). The key fields to change:
 
@@ -444,7 +568,7 @@ internal loop budgets (`LLM_BASE_MAX_ROUNDS`, `DEP_UPGRADE_MAX_ITERATIONS`,
 Job), and the GitOps PR-bot (`GITOPS_*`) — the same knobs as `.env.example`
 and the Helm chart's ConfigMap.
 
-### Step 5 — Run a one-shot Job
+#### Step 5 — Run a one-shot Job
 
 ```bash
 kubectl apply -f k8s/job.yaml
@@ -456,7 +580,7 @@ kubectl -n security logs -f job/vuln-remediate-dex
 kubectl -n security get job vuln-remediate-dex
 ```
 
-### Step 6 — Schedule automatic scans (CronJob)
+#### Step 6 — Schedule automatic scans (CronJob)
 
 ```bash
 kubectl apply -f k8s/cronjob.yaml

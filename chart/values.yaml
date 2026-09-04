@@ -186,7 +186,7 @@ rbac:
 docker:
   # Set to the host Docker socket path to enable building in k8s (optional).
   # Leave empty to run in analysis-only mode (safe default for most clusters).
-  hostSocketPath: ""
+  hostSocketPath: "/var/run/docker.sock"
 
 # ── Trivy init container ───────────────────────────────────────────────────
 trivy:
