@@ -34,12 +34,29 @@ api() {
 # 1. Ensure the monorepo exists (user repo; falls back to org endpoint).
 echo "=== repo ${OWNER}/${REPO} ==="
 if [ "$(api -o /dev/null -w '%{http_code}' "https://api.github.com/repos/${OWNER}/${REPO}")" != "200" ]; then
-  code="$(api -o /dev/null -w '%{http_code}' -X POST https://api.github.com/user/repos \
-      -d "{\"name\":\"${REPO}\",\"private\":false,\"description\":\"vuln-agent sample apps (monorepo)\"}")"
+  resp="$(mktemp)"
+  payload="{\"name\":\"${REPO}\",\"private\":false,\"description\":\"vuln-agent sample apps (monorepo)\"}"
+  code="$(api -o "${resp}" -w '%{http_code}' -X POST https://api.github.com/user/repos -d "${payload}")"
   if [ "${code}" != "201" ]; then
-    api -o /dev/null -X POST "https://api.github.com/orgs/${OWNER}/repos" \
-        -d "{\"name\":\"${REPO}\",\"private\":false,\"description\":\"vuln-agent sample apps (monorepo)\"}"
+    code="$(api -o "${resp}" -w '%{http_code}' -X POST "https://api.github.com/orgs/${OWNER}/repos" -d "${payload}")"
   fi
+  # Trust only the outcome, not the create call: it can fail (missing scope,
+  # expired token) or succeed under the TOKEN'S account when that isn't
+  # ${OWNER} — either way ${OWNER}/${REPO} is still missing and the push
+  # below would die with a misleading "Repository not found".
+  if [ "$(api -o /dev/null -w '%{http_code}' "https://api.github.com/repos/${OWNER}/${REPO}")" != "200" ]; then
+    login="$(api https://api.github.com/user | sed -n 's/.*"login": *"\([^"]*\)".*/\1/p' | head -1)"
+    {
+      echo "ERROR: ${OWNER}/${REPO} still missing after create attempt (HTTP ${code})."
+      echo "  GITHUB_TOKEN is for user: ${login:-<invalid token>}"
+      echo "  It must belong to '${OWNER}' (or an org admin) and have the classic"
+      echo "  'repo' scope — a fine-grained token needs Administration: read/write"
+      echo "  to create repos. API response: $(cat "${resp}")"
+    } >&2
+    rm -f "${resp}"
+    exit 1
+  fi
+  rm -f "${resp}"
   echo "  repo ${OWNER}/${REPO} created"
 fi
 
