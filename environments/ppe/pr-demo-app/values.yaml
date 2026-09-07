@@ -1,0 +1,7 @@
+# PPE environment values for pr-demo-app — the file vuln-agent's promotion
+# PR-bot patches (GITOPS_REPO=sgrsaga/vuln-agent,
+# GITOPS_IMAGE_PATH_TEMPLATE=environments/ppe/{repo_name}/values.yaml).
+# The promoter regex-matches the bare repo name ("pr-demo-app:<tag>") and bumps
+# the tag to the optimized image, then opens a PR — it never merges.
+image: ghcr.io/sgrsaga/pr-demo-app:v1
+replicas: 1
