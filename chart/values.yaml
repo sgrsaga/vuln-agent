@@ -2,7 +2,7 @@
 image:
   repository: ghcr.io/sgrsaga/vuln-agent
   tag: ""
-  digest: "sha256:d098fa03a5f2c133f3cc5aaecd2a9bfbc54611c1dd56b5be17e33b7c65e5cfa6"
+  digest: "sha256:29bff02ea2f8e4d8a457bdf2a3fc16bcafbae736745879ee8bcba39547de859c"
   pullPolicy: IfNotPresent
 
 # ── Anthropic API credentials ─────────────────────────────────────────────
