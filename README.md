@@ -10,36 +10,63 @@ one, and only ever reaches for Claude at the four specific points where a
 lookup table genuinely can't do the job — everything else (tag bumps, package
 upgrades, build/test/rescan verification) is deterministic and Trivy-verified.
 
+![vuln-agent — cluster-wide scan, remediate, verify, and report pipeline](vuln-agent.jpg)
+
+## Agentic flow
+
 ```mermaid
 flowchart TD
     classDef llm fill:#fff3cd,stroke:#c9971e,stroke-width:2px,color:#3a2f00
     classDef det fill:#dbe9ff,stroke:#4a76c9,stroke-width:1px,color:#0b2447
     classDef out fill:#d9f2e3,stroke:#2f9e5f,stroke-width:1px,color:#0b3d24
+    classDef ppl fill:#fde2e2,stroke:#c0564a,stroke-width:2px,color:#4a1410
 
     CRON["📅 Scheduled CronJob<br/>no human trigger needed"]:::det
     DISC["🔎 Discover every image<br/>running in the cluster<br/>skip ones unchanged since last run"]:::det
     SCAN["🩺 Trivy scan for CVEs"]:::det
     OWNEDQ{{"Is this an app you own,<br/>labeled & configured<br/>for rebuild-from-source?"}}:::det
-    REMED["🛠️ External remediation<br/>adopt a newer upstream tag, or<br/>layer an OS-package upgrade<br/>build → rescan → keep only if<br/>it provably reduced CVEs"]:::det
-    OPT["📦 tag-optimized-ext<br/>pushed to your registry<br/>(keeping 3rd-party copies<br/>is a team opt-in)"]:::out
-    LADDER["🛠️ Base ladder, deterministic:<br/>1. newer tag of the SAME base<br/>2. OS-package patch in the<br/>Dockerfile's base stage<br/>(each loop ≤5, global budget)"]:::det
-    T2["🤖 Claude<br/>only if the ladder left CVEs:<br/>reads the app's actual code<br/>(Dockerfile + manifests) and<br/>suggests a genuinely different<br/>minimal base for THIS app"]:::llm
-    TEST["✅ Every candidate is fully<br/>built + run through the app's<br/>OWN real test suite + rescan —<br/>failing attempts are kept as<br/>evidence, never silently shipped"]:::det
-    BASEART["🧱 winning base pushed standalone:<br/>tag-golden-base (zero CVEs)<br/>or tag-optimized-base"]:::out
-    DEP["🛠️ Dependency bumps<br/>only the app-introduced CVEs<br/>(base's own already handled)<br/>rebuild → test → rescan ≤5"]:::det
-    JUDGE["🤖 Claude adjudication<br/>if nothing reached zero: weighs<br/>vuln impact vs test breakage<br/>across every retained candidate,<br/>suggests code fixes"]:::llm
-    GOLDEN["🏆 tag-golden-base-app<br/>(zero CVEs, tests pass) or<br/>📦 tag-optimized-app (balanced<br/>pick — flagged non-deployable<br/>if its tests fail)"]:::out
-    SUMMARY["🤖 Claude<br/>per-image before/after report<br/>+ one run-level summary"]:::llm
-    PROMO["🚀 GitOps PR (reviewed) or<br/>ArgoCD Image Updater<br/>carries it to staging/PPE/prod<br/>(never for non-deployable picks)"]:::out
+    REMED["🛠️ External remediation loop<br/>newer upstream tag, or OS-package<br/>patch → build → rescan → keep<br/>only if it provably reduced CVEs"]:::det
+    OPT["📦 tag-optimized-ext<br/>pushed to your registry<br/>(3rd-party copies are a team opt-in)"]:::out
+
+    subgraph PHASEA["🔁 BASE-IMAGE agentic loop — ≤5 rounds, global budget of 20 attempts"]
+        LADDER["🛠️ Deterministic rungs:<br/>1. newer tag of the SAME base (≤5)<br/>2. OS-package patch in the<br/>Dockerfile's base stage (≤5)"]:::det
+        TESTA["✅ Validate EVERY candidate:<br/>rebuild → app's OWN test suite<br/>→ rescan; failures rolled back but<br/>RETAINED as evidence"]:::det
+        T2["🤖 Claude — base determination<br/>from the APPLICATION CODE<br/>(Dockerfile + manifests;<br/>already-tried bases excluded)"]:::llm
+        LADDER --> TESTA
+        TESTA -. "CVEs remain, budget left" .-> T2
+        T2 -. "adopted swap RE-ENTERS the rungs<br/>on the new base" .-> LADDER
+    end
+
+    BASEART["🧱 Winning base built standalone<br/>+ pushed: tag-golden-base (zero CVEs)<br/>or tag-optimized-base — a curated<br/>base OTHER apps can adopt"]:::out
+
+    subgraph PHASEB["🔁 APPLICATION-IMAGE agentic loop — ≤5 passes"]
+        DEP["🛠️ Bump only APP-introduced CVEs<br/>(base's own already handled) to<br/>Trivy's exact fixed versions"]:::det
+        TESTB["✅ rebuild → test → rescan"]:::det
+        DEP --> TESTB
+        TESTB -. "improved & app CVEs remain" .-> DEP
+    end
+
+    OUTQ{{"zero TOTAL CVEs<br/>+ tests passing?"}}:::det
+    JUDGE["🤖 Claude — balanced adjudication<br/>across every retained candidate:<br/>vuln impact vs test breakage,<br/>concrete code-fix suggestions"]:::llm
+    GOLDEN["🏆 tag-golden-base-app (strict golden)<br/>or 📦 tag-optimized-app (balanced pick,<br/>flagged NON-DEPLOYABLE if tests fail)"]:::out
+    SUMMARY["🤖 Claude — per-image before/after<br/>report + run-level summary,<br/>committed to the reports repo<br/>next to the app's code"]:::llm
+    DEV["👩‍💻 Developers<br/>read reports & code-fix issues →<br/>fix breaking tests, adopt golden bases,<br/>restructure Dockerfiles (e.g. go-app)"]:::ppl
+    PROMO["🚀 GitOps PR (reviewed) or<br/>ArgoCD Image Updater carries it to<br/>staging/PPE/prod<br/>(never for non-deployable picks)"]:::out
 
     CRON --> DISC --> SCAN --> OWNEDQ
-    OWNEDQ -->|no — 3rd-party image| REMED --> OPT --> PROMO
-    OWNEDQ -->|yes — internal| LADDER --> TEST
-    LADDER -. CVEs remain .-> T2 --> TEST
-    TEST --> BASEART
-    TEST --> DEP --> JUDGE --> GOLDEN --> PROMO
+    OWNEDQ -->|"no — 3rd-party image"| REMED --> OPT --> PROMO
+    OWNEDQ -->|"yes — internal"| LADDER
+    TESTA -->|"best base wins"| BASEART
+    BASEART --> DEP
+    TESTB --> OUTQ
+    OUTQ -->|yes| GOLDEN
+    OUTQ -. "no — weigh ALL attempts,<br/>passing and failing" .-> JUDGE --> GOLDEN
+    GOLDEN --> PROMO
     REMED -.-> SUMMARY
-    DEP -.-> SUMMARY
+    GOLDEN -.-> SUMMARY
+    SUMMARY ==> DEV
+    JUDGE -. "code-fix issue filed on the<br/>app's own source repo" .-> DEV
+    DEV ==>|"fixes committed → new image →<br/>next scheduled run re-validates"| DISC
 ```
 
 **The value this generates, continuously and without manual triage:**
@@ -61,7 +88,7 @@ ever patched at the image layer (no test authority means no rebuild), while an
 owned app is rebuilt from source through bounded agentic loops, every candidate
 gated by its own test suite.
 
-### External scope — zooming into the `REMED` box above (3rd-party images)
+### External scope — zooming into the external remediation loop above (3rd-party images)
 
 ```
 Input image
@@ -104,7 +131,7 @@ Input image
 | Patch applied but CVE count did not decrease | `no_improvement` |
 | `MAX_ITERATIONS` reached (default: 5) | `max_iterations` |
 
-### Internal scope — the `LADDER` → adjudication boxes above (owned apps)
+### Internal scope — the two agentic loop boxes above (owned apps)
 
 This is where the agentic looping lives, and where all four LLM call sites sit —
 each one a genuinely ambiguous decision, with everything between them
