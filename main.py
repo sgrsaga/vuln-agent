@@ -275,11 +275,16 @@ def run_discovery(args) -> int:
             "No image digests changed since the last run — skipping the "
             "run-level report and GitHub Release (nothing new to publish)"
         )
+    # A stale run-summary.md from an earlier run must never ride along on this
+    # run's release — drop it up front; only a freshly generated one is included.
+    run_summary_written = False
+    (base_output / "run-summary.md").unlink(missing_ok=True)
     if results and release_worthy:
         try:
             from agent.reporter import generate_run_report
             run_report = "# Run Summary — external & internal scopes\n\n" + generate_run_report(results)
             (base_output / "run-summary.md").write_text(run_report)
+            run_summary_written = True
             logger.info(f"Run-level report saved → {base_output / 'run-summary.md'}")
             # Also commit to the reports repo (REPORTS_REPO — no-op when unset):
             # dated record + stable latest.md for browsing/diffing.
@@ -302,7 +307,7 @@ def run_discovery(args) -> int:
         try:
             pub.create_github_release(
                 base_dir=base_output,
-                include=scanned_slugs | {"run-summary.md"},
+                include=scanned_slugs | ({"run-summary.md"} if run_summary_written else set()),
             )
         except Exception as exc:
             logger.warning(f"GitHub Release creation failed: {exc}")

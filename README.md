@@ -1,6 +1,6 @@
 # vuln-agent
 
-An agentic pipeline that automatically scans every Docker image running in a cluster and remediates by ownership: third-party images get deterministic tag bumps and OS-package patches (kept only when a rescan proves improvement), while owned applications are rebuilt from source through bounded agentic loops — Claude-suggested base images and dependency upgrades, every candidate gated by the app's own test suite — producing golden (zero-CVE) base and app images, with Claude adjudicating the best balanced pick when zero isn't reachable and writing the before/after reports.
+An agentic pipeline that automatically scans every Docker image running in a cluster and remediates by ownership: **owned applications** are rebuilt from source through bounded agentic loops — Claude-suggested base images and dependency upgrades, every candidate gated by the app's own test suite — producing golden (zero-CVE) base and app images, with Claude adjudicating the best balanced pick when zero isn't reachable and writing the before/after reports. Third-party images (not recommended and not the intended scope, but worth considering for short-term requirements) get deterministic tag bumps and OS-package patches, kept only when a rescan proves improvement.
 
 Free and open source under the [MIT license](LICENSE) — use it, fork it,
 adapt it to your organization. Read
@@ -99,6 +99,56 @@ test authority means no rebuild).
 
 ### Internal scope — the two agentic loop boxes above (owned apps)
 
+**At a glance — what happens to an owned app's image, in order.** Blue steps
+are deterministic code (lookup tables, builds, scans — same input, same
+output); yellow steps are the only places Claude is consulted; green boxes are
+what gets delivered; red is you.
+
+```mermaid
+flowchart TD
+    classDef det fill:#dbe9ff,stroke:#4a76c9,color:#0b2447
+    classDef llm fill:#fff3cd,stroke:#c9971e,stroke-width:2px,color:#3a2f00
+    classDef out fill:#d9f2e3,stroke:#2f9e5f,color:#0b3d24
+    classDef ppl fill:#fde2e2,stroke:#c0564a,stroke-width:2px,color:#4a1410
+
+    S1["1. Scan the running image with Trivy"]:::det
+    S2["2. Clone the app's source repo"]:::det
+    S3["3. Try a newer tag of the same base (≤5)"]:::det
+    S4["4. Inject an OS package patch (≤5)"]:::det
+    G["Every change: rebuild → app's own tests → rescan.<br/>Keep only if severity improves; else roll back"]:::det
+    S5["5. 🤖 LLM: pick a better base image<br/>by reading the app's code"]:::llm
+    S6["6. 🤖 LLM: restructure the Dockerfile<br/>(build with tooling, ship the minimal base)<br/>+ runtime smoke check"]:::llm
+    S7["7. Publish the winning base standalone:<br/>golden-base / optimized-base"]:::out
+    S8["8. Bump app dependencies to<br/>Trivy's fixed versions (≤5)"]:::det
+    Q{"Zero CVEs and<br/>tests passing?"}:::det
+    S9["9. 🤖 LLM: adjudicate the balanced pick —<br/>vuln impact vs test breakage,<br/>with concrete code-fix suggestions"]:::llm
+    S10["10. Push final image:<br/>🏆 golden-base-app or 📦 optimized-app<br/>→ GitOps PR opened for review (if deployable)"]:::out
+    S11["11. 🤖 LLM: write the per-image report<br/>+ the run-level summary"]:::llm
+    DEV["12. 👩‍💻 Developers act on the report:<br/>apply code fixes, adopt golden bases,<br/>fix broken tests"]:::ppl
+
+    S1 --> S2 --> S3 --> S4 --> G
+    G -->|CVEs remain| S5
+    S5 -->|"new base adopted — repeat 3–4"| S3
+    S5 -.->|"zero-CVE base lacks build tooling"| S6 --> G
+    G -->|best base found| S7 --> S8 --> Q
+    Q -->|yes| S10
+    Q -->|no| S9 --> S10
+    S10 --> S11 ==> DEV
+    DEV ==>|"next scheduled scan re-validates the fixes"| S1
+```
+
+**Why the per-image report (step 11) matters as much as the images:** the
+pipeline fixes everything a rebuild *can* fix — but what's left after step 9 is
+by definition work only a developer can do (an unfixable dependency to migrate
+away from, a test that breaks on a better base, a Dockerfile that couples the
+app to one distro). The report turns that into a concrete work list: every base
+candidate tried and why it was rejected, the adjudication's reasoning, and its
+specific code-fix suggestions — committed to the reports repo next to the app's
+own code, folded into the promotion PR body, and (for non-deployable picks)
+filed as a GitHub issue on the app's repo. When developers act on it, the next
+scheduled scan re-validates automatically (step 12 → step 1) — the pipeline and
+the team ratchet the image toward golden together, run after run.
+
 This is where the agentic looping lives, and where all five LLM call sites sit —
 each one a genuinely ambiguous decision, with everything between them
 deterministic and Trivy-verified:
@@ -131,9 +181,9 @@ Owned image (label-selected, source repo + test suite configured)
 │                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
         |
-        |  winning base ALSO built standalone + scanned:
-        |--> <base>:<base-tag>-golden-base (zero CVEs)
-        |         or -optimized-base (reduced)
+        |  winning base ALSO built standalone + scanned, pushed under a
+        |  vendor-qualified name (chainguard-python, distroless-python3-...):
+        |--> <vendor-base>:<tag>-golden-base (zero CVEs) / -optimized-base
         v
 ┌─ PHASE B: dependency loop  (<=5 passes) ─────────────────────────────────┐
 │                                                                          │
@@ -250,7 +300,8 @@ Push policy:
 | Python 3.12+ | Runtime | [python.org](https://www.python.org/downloads/) |
 | Trivy | Vulnerability scanning | [trivy.dev](https://trivy.dev/latest/getting-started/installation/) |
 | Docker CLI | Build and push patched images | [docs.docker.com](https://docs.docker.com/engine/install/) |
-| Anthropic API key | Claude Opus 4.8 (final before/after summary report) | [console.anthropic.com](https://console.anthropic.com/) |
+| crane | Daemon-less registry ops: tag listing, digest resolution, tag-bump promotion | [go-containerregistry releases](https://github.com/google/go-containerregistry/releases) |
+| Anthropic API key | Claude Opus 4.8 — the five LLM call sites (base pick, Dockerfile restructure, adjudication, per-image + run reports) | [console.anthropic.com](https://console.anthropic.com/) |
 | GitHub PAT | Create releases, push artifacts | Scopes: `repo` + `write:packages` |
 
 ---
@@ -300,6 +351,10 @@ cp .env.example .env
 | `ALLOW_MAJOR_TAG_BUMP` | No | Allow the base-image tag-bump check to cross a major version when hunting for a tag that already fixes CVEs (default: `false` — patch/minor bumps only) |
 | `RESCAN_INTERVAL_DAYS` | No | Discovery mode only: rescan an image again after this many days even if it hasn't changed (default: `7`) |
 | `FORCE_RESCAN` | No | Discovery mode only: ignore tracked scan state and rescan every discovered image this run (default: `false`) |
+| `KEEP_EXTERNAL_IMAGES` | No | Push patched EXTERNAL images as `<tag>-optimized-ext` — keeping third-party copies is a team decision (default: `true`) |
+| `LLM_BASE_MAX_ROUNDS` | No | Internal: max LLM base-determination rounds — the outer ladder loop (default: `5`) |
+| `DEP_UPGRADE_MAX_ITERATIONS` | No | Internal: max dependency-upgrade rebuild/test/rescan passes (default: `5`) |
+| `INTERNAL_MAX_ATTEMPTS` | No | Internal: global cap on build/test/rescan cycles per image — bounds the product of the nested loops (default: `20`) |
 | `GITOPS_REPO` | No | `owner/repo` of a GitOps manifests repo to open promotion PRs against. Leave empty to disable (see [Promoting optimized images](#promoting-optimized-images-to-higher-environments)) |
 | `GITOPS_TOKEN` | No | PAT with access to `GITOPS_REPO`. Falls back to `GITHUB_TOKEN` if unset |
 | `GITOPS_BASE_BRANCH` | No | Branch to open promotion PRs against (default: `main`) |
@@ -367,7 +422,7 @@ Example output for `ghcr.io/dexidp/dex:v2.45.1`:
 🔍  [scan_complete] Found 104 vulnerabilities (CRITICAL: 11, HIGH: 93)
 🏷️  [tag_bump_unavailable] No newer upstream tag improves on current CVEs
 🔧  [patch_generated] Patch Dockerfile generated (4 lines)
-✅  [improvement] Reduced by 15: 104 → 89 effective CVEs
+✅  [improvement] Severity reduced: (C,H) (11, 93) → (9, 80)
 🔍  [scan_complete] Found 89 vulnerabilities (CRITICAL: 9, HIGH: 80)
 🏁  [pipeline_complete] No further patches possible — remaining CVEs require source rebuild
 ✅  [final_image] Final optimized image: ghcr.io/sgrsaga/dex:v2.45.1-optimized-ext
@@ -378,7 +433,7 @@ Example output for `ghcr.io/dexidp/dex:v2.45.1`:
 
 ## Running in a Kubernetes cluster
 
-The agent runs as a Kubernetes **Job** (one-shot on demand) or **CronJob** (automated schedule). It mounts the node's Docker socket to build and push images without needing a Docker daemon inside the pod.
+The agent runs as a Kubernetes **Job** (one-shot on demand) or **CronJob** (automated schedule). Builds need a Docker daemon, provided one of two ways: the Helm chart runs a **Docker-in-Docker native sidecar** inside the pod (portable — works on containerd nodes with no Docker installed), while the legacy raw manifests mount the node's Docker socket.
 
 Two deployment paths, pick one:
 
@@ -391,29 +446,34 @@ Two deployment paths, pick one:
 ### Cluster architecture
 
 ```
-┌────────────────────────────────────────────────────────┐
-│  Kubernetes namespace: security                        │
-│                                                        │
-│  ┌─────────────────────────────────────────────────┐  │
-│  │  Job / CronJob pod                              │  │
-│  │                                                 │  │
-│  │  [init] trivy --download-db-only               │  │
-│  │                                                 │  │
-│  │  [main] vuln-agent                             │  │
-│  │    ├── Trivy scan          (local process)      │  │
-│  │    ├── Claude API calls    (HTTPS outbound)     │  │
-│  │    ├── docker build        (via host socket)    │  │
-│  │    └── docker push         (HTTPS outbound) ───┼──┼──► Private registry
-│  │                                                 │  │    (GHCR / ECR / GCR / ACR)
-│  │  Volumes:                                       │  │
-│  │    /var/run/docker.sock   ← hostPath            │  │
-│  │    /root/.docker/config   ← registry secret     │  │
-│  │    /app/output            ← PVC (artifacts)      │  │
-│  │    /trivy-cache           ← PVC (Trivy DB)       │  │
-│  └─────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│  Kubernetes namespace: vuln-agent (chart) / security (raw)│
+│                                                           │
+│  ┌────────────────────────────────────────────────────┐   │
+│  │  CronJob / Job pod                                 │   │
+│  │                                                    │   │
+│  │  [init]    trivy --download-db-only                │   │
+│  │  [sidecar] docker:dind (chart path — privileged,   │   │
+│  │            native sidecar; shares /var/run socket) │   │
+│  │            └ raw-manifest path mounts the node's   │   │
+│  │              /var/run/docker.sock instead          │   │
+│  │                                                    │   │
+│  │  [main] vuln-agent                                 │   │
+│  │    ├── discover pods       (k8s API, RBAC-scoped)  │   │
+│  │    ├── Trivy scan          (local process)         │   │
+│  │    ├── Claude API calls    (HTTPS outbound)        │   │
+│  │    ├── docker build/test   (in-pod dind daemon)    │   │
+│  │    └── docker push / PRs / reports (HTTPS) ────────┼───┼──► Registry, GitHub
+│  │                                                    │   │
+│  │  Volumes:                                          │   │
+│  │    /var/run                ← emptyDir shared w/dind│   │
+│  │    /home/agent/.docker     ← registry secret       │   │
+│  │    /app/output             ← PVC (artifacts+state) │   │
+│  │    /trivy-cache            ← PVC (Trivy DB)        │   │
+│  └────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────┘
           │
-          └──► GitHub Releases API (artifacts uploaded at end of run)
+          └──► GitHub Releases + reports repo + GitOps promotion PRs
 ```
 
 ### Option A — Helm chart (recommended)
@@ -730,7 +790,7 @@ USER original-user
 2. Rebuilding the binary with an updated Go toolchain
 3. Releasing a new upstream image version
 
-The agent identifies these, documents them clearly in the report, and stops iterating rather than applying ineffective patches. The report includes the exact `go get` commands needed for a source-level fix.
+For **external** images the agent identifies these, documents them clearly in the report (including the exact `go get` commands for a source-level fix), and stops iterating rather than applying ineffective patches. For **owned** images this is exactly what the internal pipeline exists for — the dependency loop bumps Go modules and rebuilds from source (see [Internal scope](#internal-scope--the-two-agentic-loop-boxes-above-owned-apps)).
 
 ---
 
@@ -777,7 +837,11 @@ not usually what you want pointed straight at production.
 Set `GITOPS_REPO` (and `GITOPS_IMAGE_PATH_TEMPLATE`) and the agent will, after
 promoting a final optimized image, patch that path in `GITOPS_REPO` and open a
 PR — it never merges anything itself, so a human always reviews the change before
-it reaches a gated environment. Re-runs that produce the same result update the
+it reaches a gated environment. The full before/after summary report is folded
+into the PR body so reviewers see the security story where they approve it, the
+PR only ever fires for **deployable** results (a balanced pick with failing
+tests never gets one), and apps without a file at the templated path are
+skipped silently. Re-runs that produce the same result update the
 existing open PR (a stable `vuln-agent/optimize-<repo>` branch) instead of piling
 up duplicates. See the `GITOPS_*` variables in [step 3](#3-configure-environment-variables)
 above for the full configuration.
@@ -962,7 +1026,7 @@ files PRs/issues on your behalf — adopt it with eyes open.
   rescan showing a severity-ordered improvement, and (for owned apps) the
   app's own test suite passing. Failing attempts are rolled back, retained
   only as evidence.
-- **Bounded, targeted LLM use** — exactly four call sites, each a genuinely
+- **Bounded, targeted LLM use** — exactly five call sites, each a genuinely
   ambiguous decision; everything else is lookup-table/deterministic code, so
   API cost is small and behavior is auditable. Deployability is decided by
   test results, never by the model.
