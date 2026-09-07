@@ -75,18 +75,15 @@ flowchart TD
     DEV ==>|"fixes committed → next scheduled run re-validates"| DISC
 ```
 
-**The value this generates, continuously and without manual triage:**
-- Every image running in the cluster gets scanned on a schedule, not just once at build time — newly-disclosed CVEs against images that never change still get caught.
-- Fixes are applied and *verified* before anything ships — a rescan has to show a real improvement, or the attempt is discarded. Nothing broken ever reaches the registry on the strength of a guess.
-- For apps you own, it goes further than patching: it rebuilds from source — a better base image *and* upgraded application dependencies — with every candidate validated against that app's *own* real test suite. A `-golden-base-app` image means **zero CVEs and every change test-verified**, not a hopeful guess; the winning base is *also* published standalone (`-golden-base`/`-optimized-base`) so other apps can adopt it directly.
-- Produces a plain-English before/after report and, for higher environments, a reviewable pull request — a human always signs off before anything reaches production.
-
-**Where Claude actually creates value (and only there):**
-1. **Suggesting an alternative base image** — but *only* as a fallback, after the deterministic rungs (a same-repo tag bump *and* an OS-package patch, each a bounded ≤5 loop) have already been tried and left CVEs behind. It reads the app's actual code context (the Dockerfile and dependency manifests, plus the list of bases already tried, to prevent cycles) and suggests minimal/distroless candidates for *this* runtime — world-knowledge an LLM has and a static table would constantly fall behind on. Everything upstream and downstream of that one decision (finding the newer tag, patching the Dockerfile, building, testing, rescanning, adopting) is deterministic code.
-2. **Restructuring the Dockerfile for a minimal runtime** — when a zero-CVE base candidate fails *only* because it lacks build tooling (no shell/pip — the distroless/Chainguard signature), Claude rewrites the Dockerfile into the builder/runtime pattern: dependencies built in a stage on the current working base, artifacts copied into the minimal candidate as the shipped stage. The proposal is never trusted: it must pass the rebuild + test gate (tests run on the builder lineage) **plus a runtime smoke run** proving the artifacts actually load on the shell-less base — and only a severity improvement adopts it.
-3. **Adjudicating the balanced pick** — when no candidate reaches zero CVEs with passing tests, Claude weighs every retained attempt (including ones whose tests failed): is fixing a low-impact CVE worth breaking tests? Is eliminating a genuinely critical, reachable CVE worth a code change? It picks the best-balanced candidate with a written justification and concrete code-fix suggestions — but deployability is decided by the actual test result, never by the model, and a failing pick is pushed only as a flagged, non-deployable artifact.
-4. **The per-image before/after summary report** — turning a raw CVE diff into a prioritized, readable narrative (what changed, what's left, how to think about the residual risk) is a writing/judgment task, not a lookup.
-5. **The run-level summary** — one report per discovery run with an External section (third-party images: improvements, residual risk, mitigation options) and an Internal section (owned apps: base selections, posture improvement, app impact and code-change justifications).
+**Where Claude actually creates value (and only there)** — the five yellow
+nodes above. Everything else is deterministic because Trivy already knows the
+exact package, fixed version, and package manager; the LLM is reserved for the
+five decisions a lookup table can't make:
+1. **Base image suggestion** — knowing which minimal/distroless bases plausibly exist for *this* app's runtime is world-knowledge a static table would constantly fall behind on. Reached only after the deterministic rungs left CVEs; prompted with the app's real code and every base already tried.
+2. **Dockerfile restructure** — when a zero-CVE base fails *only* for missing build tooling, Claude rewrites it into the builder/runtime pattern. The proposal is never trusted: rebuild + tests + a runtime smoke run must all pass, and only a severity improvement adopts it.
+3. **Balanced-pick adjudication** — when zero isn't reachable, someone must weigh "is this CVE worth a broken test?" across every retained attempt. Claude picks, justifies, and suggests concrete code fixes — but deployability always comes from the actual test result, never the model.
+4. **The per-image before/after report** — turning a raw CVE diff into a prioritized, readable narrative is a writing/judgment task, not a lookup.
+5. **The run-level summary** — one evidence-grounded External + Internal report per discovery run.
 
 ### Every activity at a glance — Deterministic vs LLM, and the value delivered
 
@@ -205,74 +202,13 @@ filed as a GitHub issue on the app's repo. When developers act on it, the next
 scheduled scan re-validates automatically (step 12 → step 1) — the pipeline and
 the team ratchet the image toward golden together, run after run.
 
-This is where the agentic looping lives, and where all five LLM call sites sit —
-each one a genuinely ambiguous decision, with everything between them
-deterministic and Trivy-verified:
-
-```
-Owned image (label-selected, source repo + test suite configured)
-        |  clone sourceRepo
-        v
-┌─ PHASE A: base ladder  (<=5 rounds, global budget of 20 attempts) ───────┐
-│                                                                          │
-│   1. Newer tag of the SAME base        (loop <=5, deterministic)         │
-│   2. OS-package patch in the base stage (loop <=5, deterministic)        │
-│        |                                                                 │
-│        | CVEs remain?                                                    │
-│        v                                                                 │
-│   3. LLM CALL 1 - base determination from APPLICATION CODE:              │
-│      reads the Dockerfile + dependency manifests, suggests minimal       │
-│      bases for THIS app (already-tried bases excluded -> no cycles)      │
-│        |                                                                 │
-│        '--> adopted swap RE-ENTERS steps 1-2 on the new base             │
-│                                                                          │
-│  3b. LLM CALL 2 - Dockerfile RESTRUCTURE: a candidate rejected only      │
-│      for missing build tooling (no shell/pip) becomes the RUNTIME        │
-│      stage; deps are built on the working base and COPY'd in.            │
-│      Gated by tests (builder lineage) + a runtime smoke run.             │
-│                                                                          │
-│   EVERY candidate: rebuild -> app's OWN test suite -> Trivy rescan.      │
-│   Adopted only on a severity improvement (CRITICAL, then HIGH);          │
-│   failures are rolled back byte-for-byte but RETAINED as evidence.       │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
-        |
-        |  winning base ALSO built standalone + scanned, pushed under a
-        |  vendor-qualified name (chainguard-python, distroless-python3-...):
-        |--> <vendor-base>:<tag>-golden-base (zero CVEs) / -optimized-base
-        v
-┌─ PHASE B: dependency loop  (<=5 passes) ─────────────────────────────────┐
-│                                                                          │
-│   Targets ONLY app-introduced CVEs (the base's own are subtracted).      │
-│   Bump to Trivy's exact fixed versions (requirements.txt /               │
-│   package.json / go.mod / pom.xml) -> rebuild -> test -> rescan,         │
-│   stopping at the first non-improvement.                                 │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
-        |
-        v
-┌─ PHASE C: outcome ───────────────────────────────────────────────────────┐
-│                                                                          │
-│   Zero TOTAL CVEs + tests passing                                        │
-│       '--> <tag>-golden-base-app  (strict golden)                        │
-│                                                                          │
-│   Otherwise LLM CALL 3 - balanced adjudication across EVERY              │
-│   retained candidate (passing and failing): weighs vulnerability         │
-│   impact vs test breakage, suggests concrete code fixes                  │
-│       '--> <tag>-optimized-app  (flagged NON-DEPLOYABLE if the           │
-│            pick's tests failed - the GitOps PR never fires for it)       │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
-        |
-        v
-LLM CALL 4 - per-image before/after report
-LLM CALL 5 - run-level summary (discovery mode: External + Internal
-             sections across every image scanned this run)
-```
-
-Internal runs end in `golden_base_app` (zero total CVEs, tests passing),
-`optimized_app` (best balanced pick), or `no_improvement` (nothing pushed).
-Configuration, onboarding, and the test-stage-lineage requirement are covered in
+Every loop above is bounded (each ≤5, plus a global budget of 20
+build/test/rescan attempts per image), and every change is validated the same
+way: rebuild → the app's own test suite → Trivy rescan, rolled back on failure
+but retained as adjudication evidence. Internal runs end in `golden_base_app`
+(zero total CVEs, tests passing), `optimized_app` (best balanced pick), or
+`no_improvement` (nothing pushed). Phase-by-phase mechanics, configuration,
+onboarding, and the test-stage-lineage rule are covered in
 [Base image hardening](#base-image-hardening--golden-images-for-owned-applications).
 
 ### External scope — zooming into the external remediation loop above (3rd-party images)
@@ -330,22 +266,10 @@ per-iteration files. At most one final app image reaches the registry per run
 | `output/summary-report.md` | Claude Opus 4.8 before/after remediation summary covering the whole image's run |
 | `output/run-summary.md` | Discovery mode only: one Claude-composed run-level report — External + Internal sections across every image scanned this run |
 | GitHub Release | The files above attached as downloadable release assets — the immutable audit archive. Discovery mode creates one **only when a filtered image's digest changed** since the last run (scoped to that run's files), so a scheduled tick over an unchanged environment publishes nothing |
-| Reports repo (optional) | With `REPORTS_REPO` set, every report is *also* committed as rendered, diffable markdown: `reports/<repo>/<tag>/<date>-summary.md` + a stable `reports/<repo>/<tag>/latest.md` per image, and `reports/run-summary/` for discovery runs. This is the **stakeholder-facing reference location** — share the repo (or specific `latest.md` links) with security, platform, and app teams, auditors, or anyone interested. Because reports land as plain markdown at stable paths, the same content is trivially forwarded into whatever your stakeholders already use — Notion, Confluence, Jira, Slack digests — by pointing their importers/automation at this repo; no agent changes needed |
+| Reports repo (optional) | With `REPORTS_REPO` set, every report is *also* committed as rendered, diffable markdown at stable paths (`reports/<repo>/<tag>/latest.md` + dated history, `reports/run-summary/`). The **stakeholder-facing reference location**: share links with any team or auditor, or point Notion/Confluence/Jira/Slack importers at it — no agent changes needed |
 | Promotion PR body | The per-image summary is folded into the GitOps promotion PR (collapsed section), so reviewers see the security story where they approve the change |
 | Code-fix issue | A non-deployable balanced pick files the adjudication's `code_fixes` as a GitHub Issue on the app's own source repo (stable title — re-runs comment instead of duplicating) |
-| Final image | External: `<name>:<original-tag>-optimized-ext` (any real improvement, incl. a tag bump alone reaching zero — gated by `KEEP_EXTERNAL_IMAGES`). Internal: `-golden-base-app` (zero CVEs, tests passing) or `-optimized-app` (best balanced pick) — plus the winning base standalone as `-golden-base`/`-optimized-base` |
-
-Push policy:
-- Nothing to patch on the first scan → no image pushed, the run is already clean.
-- Any external improvement — a tag bump (even one that alone reaches zero
-  vulnerabilities), an OS-package patch, or both — is pushed as
-  `<name>:<original-tag>-optimized-ext`, unless `KEEP_EXTERNAL_IMAGES=false`
-  (keeping third-party copies is a team decision; internal images always keep
-  their result).
-- An internal `-optimized-app` whose tests failed (a deliberate balanced pick —
-  e.g. a critical CVE eliminated at the cost of a test that needs a code fix)
-  is still pushed as evidence, but flagged **non-deployable** in the report and
-  never promoted by the GitOps PR-bot.
+| Final image | External: `<name>:<original-tag>-optimized-ext` — any real improvement, incl. a tag bump alone reaching zero (gated by `KEEP_EXTERNAL_IMAGES`; nothing is pushed for an already-clean image). Internal: `-golden-base-app` (zero CVEs, tests passing) or `-optimized-app` (best balanced pick — if its tests failed it is still pushed as flagged **non-deployable** evidence and never promoted), plus the winning base standalone as `-golden-base`/`-optimized-base` |
 
 ---
 
