@@ -128,6 +128,12 @@ def _current_base(df_path: str) -> str | None:
     return stage["base"] if stage else None
 
 
+def _snapshot_base(df_text: str) -> str | None:
+    """Final-stage base of a Dockerfile given as text (trail labels only)."""
+    stage = _resolve_final_base_stage(_parse_stages(df_text))
+    return stage["base"] if stage else None
+
+
 def _patch_dockerfile_base(dockerfile_path: str, candidate_base: str) -> str | None:
     with open(dockerfile_path) as fh:
         lines = fh.readlines()
@@ -362,27 +368,150 @@ code_fixes may be [] when the chosen candidate passes tests cleanly."""
 
 # ── Validation core ───────────────────────────────────────────────────────────
 
+# A candidate that failed because the base lacks BUILD tooling (no shell, no
+# pip/apt — the distroless/chainguard signature) is not unusable: the build can
+# happen in a stage that HAS the tooling, with artifacts copied into the
+# minimal runtime. These signatures gate the restructure attempt; genuine test
+# failures never match.
+_TOOLING_FAILURE_RE = re.compile(
+    r"/bin/sh[^\n]*(no such file|not found|stat /bin/sh)"
+    r"|stat /bin/sh: no such file"
+    r"|\b(pip|pip3|apt-get|apk|yum|sh)\b[^\n]{0,40}?\b(not found|no such file)"
+    r"|executable file not found",
+    re.IGNORECASE,
+)
+
+
+def _is_tooling_failure(outcome: str) -> bool:
+    return bool(_TOOLING_FAILURE_RE.search(outcome or ""))
+
+
+def propose_restructure(
+    dockerfile_text: str,
+    runtime_base: str,
+    builder_base: str,
+    test_stage: str | None,
+    code_context: str,
+) -> dict | None:
+    """
+    LLM call site 5 — Dockerfile restructuring. When a low/zero-CVE runtime
+    candidate fails ONLY because it lacks build tooling, ask Claude to rewrite
+    the Dockerfile into the builder/runtime pattern: dependencies built in a
+    stage based on the current WORKING base (which has the tooling), artifacts
+    copied into the minimal candidate as the final runtime stage. Returns
+    {"dockerfile": str, "smoke_command": [argv...]} or None. The proposal is
+    only ever ADOPTED after the standard gates (rebuild + tests + rescan) plus
+    a runtime smoke check — because tests now run on the builder lineage, the
+    smoke run is what proves the copied artifacts actually load on the
+    shell-less runtime base.
+    """
+    test_note = (f'The test stage MUST keep its exact name "{test_stage}" and MUST be based '
+                 f"on the builder stage (the runtime base has no shell to run tests in)."
+                 if test_stage else
+                 "There is no dedicated test stage; keep the build runnable as before.")
+    prompt = f"""You are restructuring a Dockerfile so a minimal, low-vulnerability base can be
+used at RUNTIME even though it lacks build tooling (no shell/pip/apt).
+
+Current Dockerfile:
+```dockerfile
+{dockerfile_text}
+```
+
+Application context (dependency manifests, truncated):
+{code_context}
+
+Rewrite it as a multi-stage build:
+- A stage named "builder" based on `{builder_base}` performing ALL dependency
+  installation and build steps (it has a shell and package tooling).
+- {test_note}
+- The FINAL stage (last in the file — what a plain `docker build` produces)
+  based on `{runtime_base}`, which has NO shell: it may only COPY artifacts
+  (from the builder and the source tree) and set metadata. Use exec-form
+  CMD/ENTRYPOINT valid without a shell, with interpreter paths that exist in
+  `{runtime_base}`. Ensure interpreter/library versions match between builder
+  and runtime (pin the builder accordingly if needed).
+
+Also provide a smoke command: an argv list to run as
+`docker run <image> <argv...>` against the final image that verifies the
+application's entry module actually loads on the minimal base and exits 0
+within a few seconds (an import/--version style check, NOT starting a server).
+If `{runtime_base}` defines an ENTRYPOINT, the argv must be valid as its
+arguments; otherwise include the absolute interpreter path.
+
+Respond with ONLY a JSON object, nothing else:
+{{"dockerfile": "<full new Dockerfile text>", "smoke_command": ["<argv>", ...]}}"""
+
+    try:
+        client = _get_client()
+        response = client.messages.create(
+            model="claude-opus-4-8", max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(b.text for b in response.content if b.type == "text").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL)
+        try:
+            proposal = json.loads(raw)
+        except json.JSONDecodeError:
+            # Models sometimes wrap the object in prose despite instructions —
+            # recover the outermost JSON object before giving up.
+            start, end = raw.find("{"), raw.rfind("}")
+            if start < 0 or end <= start:
+                raise
+            proposal = json.loads(raw[start:end + 1])
+        df = proposal.get("dockerfile", "")
+        smoke = proposal.get("smoke_command")
+        if not df.strip() or not _FROM_RE.search(df.splitlines()[0].strip()) and "FROM" not in df:
+            raise ValueError("proposal has no usable Dockerfile")
+        if not (isinstance(smoke, list) and smoke and all(isinstance(a, str) for a in smoke)):
+            raise ValueError("proposal has no usable smoke_command")
+        # The candidate must actually be the FINAL stage's base, or the rewrite
+        # didn't do what was asked.
+        final = _resolve_final_base_stage(_parse_stages(df))
+        if not final or final["base"] != runtime_base:
+            raise ValueError(f"final stage base is {final and final['base']}, expected {runtime_base}")
+        return {"dockerfile": df, "smoke_command": smoke}
+    except Exception as exc:
+        logger.warning(f"Restructure proposal failed ({exc}) — candidate stays rejected")
+        return None
+
+
+def _runtime_smoke(tag: str, smoke_command: list[str], timeout: int = 60) -> int:
+    """Run the proposal's smoke argv against the final image, network-denied."""
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", tag, *smoke_command],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        logger.debug(f"runtime smoke failed ({result.returncode}): {result.stderr[-500:]}")
+    return result.returncode
+
+
 def _build_test_scan(
-    repo_dir: str,
+    app_dir: str,
     tag: str,
     test_stage: str | None,
     test_command: str | None,
     baseline_key: tuple[int, int],
+    smoke_command: list[str] | None = None,
 ) -> dict:
     """
     Build + run the app's real tests + rescan. Unlike earlier versions, a
     test-failing candidate is still fully built and scanned so it can be
     retained as an adjudication candidate. `improved` requires tests passing
-    AND a strictly better severity key.
+    AND a strictly better severity key. When `smoke_command` is given (a
+    restructured builder/runtime candidate — tests ran on the BUILDER lineage),
+    the final image must additionally pass the runtime smoke run, since only
+    that proves the artifacts load on the shell-less runtime base.
     """
     result: dict = {"tag": tag, "tests_passed": False, "vulns": None,
                     "improved": False, "outcome": ""}
     try:
         if test_stage:
-            build_from_context(repo_dir, f"{tag}-test", target=test_stage)
+            build_from_context(app_dir, f"{tag}-test", target=test_stage)
             result["tests_passed"] = True
         else:
-            build_from_context(repo_dir, tag)
+            build_from_context(app_dir, tag)
             rc = run_isolated(tag, test_command)
             result["tests_passed"] = rc == 0
             if rc != 0:
@@ -391,12 +520,22 @@ def _build_test_scan(
         result["outcome"] = f"build/test failed: {exc}"
 
     try:
-        build_from_context(repo_dir, tag)  # final runtime image
+        build_from_context(app_dir, tag)  # final runtime image
         raw_scan = scan_image(tag)
         result["vulns"] = extract_vulnerabilities(raw_scan)
     except Exception as exc:
         result["outcome"] = result["outcome"] or f"final build/rescan failed: {exc}"
         return result
+
+    if result["tests_passed"] and smoke_command:
+        try:
+            rc = _runtime_smoke(tag, smoke_command)
+        except Exception as exc:
+            rc = -1
+            logger.debug(f"runtime smoke errored: {exc}")
+        if rc != 0:
+            result["tests_passed"] = False
+            result["outcome"] = f"runtime smoke failed (exit {rc}) — artifacts don't load on the minimal base"
 
     key = severity_key(result["vulns"])
     if result["tests_passed"]:
@@ -410,12 +549,33 @@ def _build_test_scan(
 
 # ── Base artifact publication (2.5) ──────────────────────────────────────────
 
+def _base_artifact_name(base_repo: str) -> str:
+    """
+    Vendor-qualified artifact repo name for a base ref, so curated bases from
+    different vendors never collide under GHCR_NAMESPACE: the bare last path
+    component would map both `python` and `cgr.dev/chainguard/python` onto
+    `python:...`. Drops the registry host and Docker Hub's implicit `library/`,
+    then joins the remaining path with '-':
+      python                        -> python
+      docker.io/library/python      -> python
+      cgr.dev/chainguard/python     -> chainguard-python
+      gcr.io/distroless/python3-... -> distroless-python3-...
+    """
+    parts = base_repo.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0]):
+        parts = parts[1:]   # registry host
+    if len(parts) > 1 and parts[0] == "library":
+        parts = parts[1:]   # Docker Hub's implicit namespace
+    return "-".join(parts) or base_repo
+
+
 def _publish_base_artifact(df_path: str, base_changed: bool) -> dict:
     """
     Scan the winning state's resolved base standalone (always — Phase B needs
     its vuln IDs for the app-introduced delta), and, when Phase A actually
-    changed something, publish it as {base}:{tag}-golden-base (zero CVEs) or
-    -optimized-base under GHCR_NAMESPACE.
+    changed something, publish it as a vendor-qualified
+    {artifact-name}:{tag}-golden-base (zero CVEs) or -optimized-base under
+    GHCR_NAMESPACE (see _base_artifact_name).
     """
     base_ref = _current_base(df_path)
     out: dict = {"base_ref": base_ref, "published": None, "vuln_ids": set()}
@@ -453,8 +613,9 @@ def _publish_base_artifact(df_path: str, base_changed: bool) -> dict:
         return out
     base_repo, base_tag = split
     suffix = "golden-base" if severity_key(base_vulns) == (0, 0) else "optimized-base"
-    dest = (f"{GHCR_NAMESPACE}/{tag_finder.repo_name(base_repo)}:{base_tag}-{suffix}"
-            if GHCR_NAMESPACE else f"{tag_finder.repo_name(base_repo)}:{base_tag}-{suffix}")
+    artifact_repo = _base_artifact_name(base_repo)
+    dest = (f"{GHCR_NAMESPACE}/{artifact_repo}:{base_tag}-{suffix}"
+            if GHCR_NAMESPACE else f"{artifact_repo}:{base_tag}-{suffix}")
     try:
         tag_local_image(local_tag, dest)
         if GHCR_NAMESPACE:
@@ -540,16 +701,18 @@ def remediate_internal(
 
         code_ctx = _code_context(app_dir, os.path.basename(df_path))
         tried_bases: set[str] = {original_base}
+        restructured: set[str] = set()   # candidates already given their one restructure shot
 
         def budget_left() -> bool:
             return attempt_n < INTERNAL_MAX_ATTEMPTS
 
-        def attempt(step: str, detail: str) -> bool:
+        def attempt(step: str, detail: str, smoke_command: list[str] | None = None) -> bool:
             """Validate current repo state; adopt on improvement; always retain the state."""
             nonlocal best_tag, best_vulns, best_key, attempt_n
             attempt_n += 1
             tag = f"vuln-agent-harden/{repo_name}:{attempt_n}"
-            r = _build_test_scan(app_dir, tag, test_stage, test_command, best_key)
+            r = _build_test_scan(app_dir, tag, test_stage, test_command, best_key,
+                                 smoke_command=smoke_command)
             states.append({"step": step, "detail": detail, **r})
             if r["improved"]:
                 best_tag, best_vulns, best_key = tag, r["vulns"], severity_key(r["vulns"])
@@ -623,12 +786,41 @@ def remediate_internal(
                     swapped = True
                     break
                 _restore(snap)
+
+                # 2.4b — builder/runtime restructure (LLM call site 5): a
+                # candidate rejected only because it LACKS BUILD TOOLING (the
+                # distroless/chainguard "/bin/sh missing" signature) can still
+                # serve as the RUNTIME base — build in a stage on the current
+                # working base, copy artifacts in. Gated like everything else
+                # (rebuild + tests on the builder lineage + rescan) PLUS a
+                # runtime smoke run proving the artifacts load on the minimal
+                # base. One restructure attempt per candidate, on budget.
+                if (candidate not in restructured
+                        and _is_tooling_failure(states[-1]["outcome"])
+                        and budget_left()):
+                    restructured.add(candidate)
+                    with open(df_path) as fh:
+                        working_df = fh.read()
+                    proposal = propose_restructure(
+                        working_df, candidate, _current_base(df_path),
+                        test_stage, code_ctx,
+                    )
+                    if proposal:
+                        snap2 = _snapshot(app_dir, df_path)
+                        with open(df_path, "w") as fh:
+                            fh.write(proposal["dockerfile"])
+                        if attempt("restructure",
+                                   f"builder({_snapshot_base(working_df)}) + runtime({candidate})",
+                                   smoke_command=proposal["smoke_command"]):
+                            swapped = True
+                            break
+                        _restore(snap2)
             if not swapped:
                 break
 
         # ═══ 2.5: standalone base artifact + base vuln IDs for the delta ═══
         base_changed = any(
-            s["improved"] and s["step"] in ("base-tag-bump", "os-patch", "llm-base")
+            s["improved"] and s["step"] in ("base-tag-bump", "os-patch", "llm-base", "restructure")
             for s in states
         )
         base_artifact = _publish_base_artifact(df_path, base_changed)

@@ -16,10 +16,12 @@ label-selected) images are rebuilt from source through bounded phased loops
 `<tag>-golden-base-app` (strict golden: zero TOTAL CVEs and tests passing) or
 `<tag>-optimized-app` (best balanced pick — possibly flagged non-deployable when
 its tests fail), plus the winning base published standalone as
-`<base>:<base-tag>-golden-base`/`-optimized-base`. Exactly four LLM call sites,
+`<base>:<base-tag>-golden-base`/`-optimized-base`. Exactly five LLM call sites,
 all in service of genuinely ambiguous decisions: base suggestion from app code
-context, balanced-pick adjudication, the per-image summary report, and the
-discovery-run-level report — everything else is deterministic and Trivy-verified.
+context, Dockerfile restructuring to a builder/runtime split (when a zero-CVE
+base fails only for missing build tooling), balanced-pick adjudication, the
+per-image summary report, and the discovery-run-level report — everything else
+is deterministic and Trivy-verified.
 See `README.md` for the full user-facing walkthrough (local setup, k8s
 deployment, output format).
 
@@ -200,10 +202,28 @@ phases, cumulative — each adopted step builds on the last:
     Candidates are applied with rung 2's injected upgrade lines stripped
     (`_strip_injected_upgrade`) — another family's package-manager command
     would just break the new base's build.
+  - **Rung 3b — builder/runtime restructure** (`propose_restructure()`,
+    Claude): when a candidate fails ONLY with a build-tooling-absence
+    signature (`_is_tooling_failure()`: `/bin/sh` missing, `pip`/`apt-get` not
+    found — the distroless/chainguard case), the candidate isn't unusable, the
+    Dockerfile is: Claude rewrites it into builder (current working base, does
+    all installs; test stage keeps its name and moves to the builder lineage)
+    + final runtime stage on the minimal candidate (COPY-only, exec-form CMD).
+    The proposal is validated structurally (final-stage base must equal the
+    candidate) and then gated like any candidate PLUS `_runtime_smoke()` — a
+    `docker run --network none <image> <smoke argv>` proving the copied
+    artifacts load on the shell-less base, since tests no longer run on the
+    exact shipped lineage (the documented test-lineage rule's one deliberate
+    exception; the trail step is `restructure` and reports must present the
+    weaker "tests on builder lineage + smoke-verified runtime" claim
+    honestly). One attempt per candidate (`restructured` set), on budget.
   Then `_publish_base_artifact()`: the winning base (plus any injected upgrade
-  layer) is built **standalone**, scanned, and pushed under the base repo's
-  name as `-golden-base` (zero CVEs) or `-optimized-base`; its vuln IDs feed
-  Phase B's delta.
+  layer) is built **standalone**, scanned, and pushed as `-golden-base` (zero
+  CVEs) or `-optimized-base` under a VENDOR-QUALIFIED name
+  (`_base_artifact_name()`: registry host and Docker Hub's `library/` dropped,
+  remaining path joined with '-', so `cgr.dev/chainguard/python` →
+  `chainguard-python:...` never collides with the Docker-library `python:...`);
+  its vuln IDs feed Phase B's delta.
 - **Phase B — dependency loop** (≤ `DEP_UPGRADE_MAX_ITERATIONS`, default 5) —
   targets only the **app-introduced delta** (app scan minus the standalone base
   scan's IDs): `dep_upgrader.apply()` bumps to Trivy's own reported fixed
@@ -257,7 +277,13 @@ discovered image through `orchestrator.run()` sequentially, each into its own
 LLM call site: one External + one Internal section across every image this run,
 best-effort/try-except so a report failure never fails the run) and creates one
 combined GitHub Release at the end (`create_release=False` per-image, one final
-call).
+call). The run report is EVIDENCE-GROUNDED: `orchestrator._done()` folds the
+slim trail, adjudication judgment, `deployable`, and base artifact into each
+result dict (skipped images instead carry `skipped_unchanged_since`), and the
+prompt carries strict grounding rules (no invented reasons, never infer from an
+image's name, skipped images reported as prior outcomes) — added after a real
+run summary was caught speculating. `image_tracker.record_result()` still
+persists only the slim fields, so the state file never bloats with trails.
 
 Since discovery mode is what the CronJob runs on a schedule (`chart/templates/cronjob.yaml`),
 `agent/image_tracker.py` skips images that haven't changed since last time, keyed

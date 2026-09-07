@@ -191,8 +191,29 @@ def generate_run_report(results: list[tuple[str, dict]]) -> str:
     internal_statuses = {"golden_base_app", "optimized_app"}
     ext_lines, int_lines = [], []
     for image, r in results:
-        line = (f"- `{image}` → status `{r.get('status')}`, final `{r.get('final_image')}`, "
-                f"remaining HIGH/CRITICAL: {r.get('remaining_vulns')}")
+        block = [f"- `{image}` → status `{r.get('status')}`, final `{r.get('final_image')}`, "
+                 f"remaining HIGH/CRITICAL: {r.get('remaining_vulns')}"]
+        if r.get("skipped_unchanged_since"):
+            block.append(f"  - SKIPPED this run — digest unchanged; the status above is the "
+                         f"recorded outcome from {r['skipped_unchanged_since']}, no new work was done")
+        if r.get("deployable") is False:
+            block.append("  - ⚠️ NON-DEPLOYABLE: the chosen candidate's tests FAILED — "
+                         "pushed as evidence only, promotion blocked")
+        ba = r.get("base_artifact")
+        if ba and (ba.get("published") or ba.get("ref")):
+            block.append(f"  - base artifact: `{ba.get('published') or ba.get('ref')}`")
+        for t in (r.get("trail") or [])[:12]:
+            detail = str(t.get("detail", ""))[:100]
+            counts = ("" if t.get("critical") is None
+                      else f" (C={t['critical']}, H={t['high']})")
+            block.append(f"  - [{t.get('step')}] {detail} → {str(t.get('outcome', ''))[:120]}; "
+                         f"tests {'passed' if t.get('tests_passed') else 'FAILED'}{counts}")
+        j = r.get("judgment")
+        if j:
+            block.append(f"  - adjudication justification: {str(j.get('justification', ''))[:400]}")
+            for f in (j.get("code_fixes") or [])[:6]:
+                block.append(f"  - adjudication code fix: {str(f)[:200]}")
+        line = "\n".join(block)
         if r.get("status") in internal_statuses or (
             r.get("status") == "no_improvement" and "-app" in str(r.get("final_image", ""))
         ):
@@ -216,10 +237,16 @@ Write a Markdown report with exactly two top-level sections:
    remains (compensating controls, upstream-watch guidance, etc.).
 
 2. **Internal images** — detail: which base image selections were made and why
-   they improve the security posture, any impact to the applications evidenced
-   by test-case failures, and — where a new base or fix implies code-base
-   changes — a proper justification of why changing the code is worth the
-   overall security improvement.
+   they improve the security posture (use the per-step trail evidence: every
+   candidate tried, why each was rejected — build/test failure or no
+   improvement — and what won), any impact to the applications evidenced by
+   test-case failures, and — where the adjudication supplied code fixes — relay
+   those fixes and their justification.
+
+GROUNDING RULES (strict): every claim must be traceable to the evidence lines
+above. If the evidence does not record a reason, say it isn't recorded — do
+NOT invent one. Never infer anything from an image's *name*. For images marked
+SKIPPED, report them as unchanged-since-last-run, not as work done this run.
 
 Close with a short holistic assessment of the cluster's security-posture trend.
 Be precise, technical, and actionable."""

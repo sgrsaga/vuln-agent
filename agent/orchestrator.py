@@ -463,10 +463,19 @@ def _finish(
 
     remaining = len(final_vulns)
 
-    return _done(status, final_image, iteration, remaining, create_release)
+    return _done(status, final_image, iteration, remaining, create_release, extras={
+        # Evidence for the run-level report (reporter.generate_run_report) —
+        # grounded facts so it never has to speculate: the full internal trail,
+        # the adjudication verdict, deployability, and the base artifact.
+        "trail": trail or None,
+        "judgment": judgment,
+        "deployable": deployable,
+        "base_artifact": base_artifact,
+    })
 
 
-def _done(status: str, image: str, iterations: int, remaining: int, create_release: bool) -> dict:
+def _done(status: str, image: str, iterations: int, remaining: int,
+          create_release: bool, extras: dict | None = None) -> dict:
     if create_release:
         try:
             publisher.create_github_release()
@@ -477,4 +486,5 @@ def _done(status: str, image: str, iterations: int, remaining: int, create_relea
         "final_image": image,
         "iterations": iterations,
         "remaining_vulns": remaining,
+        **(extras or {}),
     }

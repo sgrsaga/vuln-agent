@@ -11,7 +11,7 @@ before running it against a real cluster.
 
 Deployed as a scheduled Kubernetes CronJob (see `chart/`), with zero manual
 triggering: it discovers every image running across your cluster, scans each
-one, and only ever reaches for Claude at the four specific points where a
+one, and only ever reaches for Claude at the five specific points where a
 lookup table genuinely can't do the job — everything else (tag bumps, package
 upgrades, build/test/rescan verification) is deterministic and Trivy-verified.
 
@@ -37,9 +37,12 @@ flowchart TD
         LADDER["🛠️ Deterministic rungs:<br/>1. newer tag of the SAME base (≤5)<br/>2. OS-package patch in the<br/>Dockerfile's base stage (≤5)"]:::det
         TESTA["✅ Validate EVERY candidate:<br/>rebuild → app's OWN test suite<br/>→ rescan; failures rolled back but<br/>RETAINED as evidence"]:::det
         T2["🤖 Claude — base determination<br/>from the APPLICATION CODE<br/>(Dockerfile + manifests;<br/>already-tried bases excluded)"]:::llm
+        RESTR["🤖 Claude — Dockerfile restructure:<br/>zero-CVE base lacks build tooling?<br/>build in a stage WITH tooling,<br/>COPY artifacts into the minimal<br/>runtime + smoke-verify it"]:::llm
         LADDER --> TESTA
         TESTA -. "CVEs remain, budget left" .-> T2
         T2 -. "adopted swap RE-ENTERS the rungs<br/>on the new base" .-> LADDER
+        TESTA -. "candidate failed ONLY for<br/>missing shell/pip" .-> RESTR
+        RESTR -. "builder/runtime split<br/>re-validated + smoke-gated" .-> TESTA
     end
 
     BASEART["🧱 Winning base built standalone<br/>+ pushed: tag-golden-base (zero CVEs)<br/>or tag-optimized-base — a curated<br/>base OTHER apps can adopt"]:::out
@@ -82,9 +85,10 @@ flowchart TD
 
 **Where Claude actually creates value (and only there):**
 1. **Suggesting an alternative base image** — but *only* as a fallback, after the deterministic rungs (a same-repo tag bump *and* an OS-package patch, each a bounded ≤5 loop) have already been tried and left CVEs behind. It reads the app's actual code context (the Dockerfile and dependency manifests, plus the list of bases already tried, to prevent cycles) and suggests minimal/distroless candidates for *this* runtime — world-knowledge an LLM has and a static table would constantly fall behind on. Everything upstream and downstream of that one decision (finding the newer tag, patching the Dockerfile, building, testing, rescanning, adopting) is deterministic code.
-2. **Adjudicating the balanced pick** — when no candidate reaches zero CVEs with passing tests, Claude weighs every retained attempt (including ones whose tests failed): is fixing a low-impact CVE worth breaking tests? Is eliminating a genuinely critical, reachable CVE worth a code change? It picks the best-balanced candidate with a written justification and concrete code-fix suggestions — but deployability is decided by the actual test result, never by the model, and a failing pick is pushed only as a flagged, non-deployable artifact.
-3. **The per-image before/after summary report** — turning a raw CVE diff into a prioritized, readable narrative (what changed, what's left, how to think about the residual risk) is a writing/judgment task, not a lookup.
-4. **The run-level summary** — one report per discovery run with an External section (third-party images: improvements, residual risk, mitigation options) and an Internal section (owned apps: base selections, posture improvement, app impact and code-change justifications).
+2. **Restructuring the Dockerfile for a minimal runtime** — when a zero-CVE base candidate fails *only* because it lacks build tooling (no shell/pip — the distroless/Chainguard signature), Claude rewrites the Dockerfile into the builder/runtime pattern: dependencies built in a stage on the current working base, artifacts copied into the minimal candidate as the shipped stage. The proposal is never trusted: it must pass the rebuild + test gate (tests run on the builder lineage) **plus a runtime smoke run** proving the artifacts actually load on the shell-less base — and only a severity improvement adopts it.
+3. **Adjudicating the balanced pick** — when no candidate reaches zero CVEs with passing tests, Claude weighs every retained attempt (including ones whose tests failed): is fixing a low-impact CVE worth breaking tests? Is eliminating a genuinely critical, reachable CVE worth a code change? It picks the best-balanced candidate with a written justification and concrete code-fix suggestions — but deployability is decided by the actual test result, never by the model, and a failing pick is pushed only as a flagged, non-deployable artifact.
+4. **The per-image before/after summary report** — turning a raw CVE diff into a prioritized, readable narrative (what changed, what's left, how to think about the residual risk) is a writing/judgment task, not a lookup.
+5. **The run-level summary** — one report per discovery run with an External section (third-party images: improvements, residual risk, mitigation options) and an Internal section (owned apps: base selections, posture improvement, app impact and code-change justifications).
 
 ## How it works
 
@@ -95,7 +99,7 @@ test authority means no rebuild).
 
 ### Internal scope — the two agentic loop boxes above (owned apps)
 
-This is where the agentic looping lives, and where all four LLM call sites sit —
+This is where the agentic looping lives, and where all five LLM call sites sit —
 each one a genuinely ambiguous decision, with everything between them
 deterministic and Trivy-verified:
 
@@ -115,6 +119,11 @@ Owned image (label-selected, source repo + test suite configured)
 │      bases for THIS app (already-tried bases excluded -> no cycles)      │
 │        |                                                                 │
 │        '--> adopted swap RE-ENTERS steps 1-2 on the new base             │
+│                                                                          │
+│  3b. LLM CALL 2 - Dockerfile RESTRUCTURE: a candidate rejected only      │
+│      for missing build tooling (no shell/pip) becomes the RUNTIME        │
+│      stage; deps are built on the working base and COPY'd in.            │
+│      Gated by tests (builder lineage) + a runtime smoke run.             │
 │                                                                          │
 │   EVERY candidate: rebuild -> app's OWN test suite -> Trivy rescan.      │
 │   Adopted only on a severity improvement (CRITICAL, then HIGH);          │
@@ -141,7 +150,7 @@ Owned image (label-selected, source repo + test suite configured)
 │   Zero TOTAL CVEs + tests passing                                        │
 │       '--> <tag>-golden-base-app  (strict golden)                        │
 │                                                                          │
-│   Otherwise LLM CALL 2 - balanced adjudication across EVERY              │
+│   Otherwise LLM CALL 3 - balanced adjudication across EVERY              │
 │   retained candidate (passing and failing): weighs vulnerability         │
 │   impact vs test breakage, suggests concrete code fixes                  │
 │       '--> <tag>-optimized-app  (flagged NON-DEPLOYABLE if the           │
@@ -150,8 +159,8 @@ Owned image (label-selected, source repo + test suite configured)
 └──────────────────────────────────────────────────────────────────────────┘
         |
         v
-LLM CALL 3 - per-image before/after report
-LLM CALL 4 - run-level summary (discovery mode: External + Internal
+LLM CALL 4 - per-image before/after report
+LLM CALL 5 - run-level summary (discovery mode: External + Internal
              sections across every image scanned this run)
 ```
 
@@ -869,8 +878,12 @@ Two things both have to be true:
      all under a global `INTERNAL_MAX_ATTEMPTS` (default 20) build/test/rescan
      budget.
    The winning base is then built **standalone** and scanned: zero CVEs →
-   pushed as `<base-repo>:<base-tag>-golden-base`, otherwise
+   pushed as `<vendor-qualified-name>:<base-tag>-golden-base`, otherwise
    `-optimized-base` — a curated base other owned apps can adopt directly.
+   Names are vendor-qualified so catalog entries never collide:
+   `cgr.dev/chainguard/python` publishes as `chainguard-python:...`,
+   `gcr.io/distroless/python3-debian12` as `distroless-python3-debian12:...`,
+   while Docker-library bases keep their bare name (`python:...`).
 3. CVEs the standalone base scan *doesn't* show are application-introduced by
    definition — the **dependency loop** targets exactly that delta, bumping to
    the fixed versions Trivy reports (requirements.txt / package.json / go.mod /
@@ -898,6 +911,16 @@ test run never actually exercises the new candidate base — it validates the
 `test` to build on top of the runtime stage (`FROM runtime AS test`, or an
 earlier stage in the runtime's own lineage) so a passing test run is real
 evidence about the image that's actually about to be pushed.
+
+**The one deliberate exception — restructured minimal runtimes**: when the
+agent's restructure step (LLM call 2) converts a Dockerfile to a
+builder/runtime split so a shell-less base (distroless/Chainguard) can ship,
+tests *cannot* run on the runtime stage at all — they run on the builder
+lineage (same interpreter and installed dependencies), and the runtime image
+must additionally pass a **smoke run** (`docker run --network none` executing
+an import/version check) proving the copied artifacts load on the minimal
+base. That's a weaker guarantee than same-lineage testing, it's flagged as the
+`restructure` step in the trail, and the report states it explicitly.
 
 ### Isolation — a known, documented limitation
 

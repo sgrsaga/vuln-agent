@@ -225,6 +225,10 @@ def run_discovery(args) -> int:
                 "final_image": entry.get("final_image"),
                 "iterations": entry.get("iterations"),
                 "remaining_vulns": entry.get("remaining_vulns"),
+                # Marker for the run-level report: this is last run's recorded
+                # outcome, not fresh work — the report must say so, not invent
+                # a story for it.
+                "skipped_unchanged_since": entry.get("last_scanned"),
             }))
             continue
 
