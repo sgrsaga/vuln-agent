@@ -15,8 +15,6 @@ one, and only ever reaches for Claude at the five specific points where a
 lookup table genuinely can't do the job — everything else (tag bumps, package
 upgrades, build/test/rescan verification) is deterministic and Trivy-verified.
 
-![vuln-agent — cluster-wide scan, remediate, verify, and report pipeline](vuln-agent.jpg)
-
 ## Agentic flow
 
 ```mermaid
@@ -27,54 +25,54 @@ flowchart TD
     classDef ppl fill:#fde2e2,stroke:#c0564a,stroke-width:2px,color:#4a1410
 
     CRON["📅 Scheduled CronJob<br/>no human trigger needed"]:::det
-    DISC["🔎 Discover every image<br/>running in the cluster<br/>skip ones unchanged since last run"]:::det
+    DISC["🔎 Discover every image running in the cluster<br/>skip ones unchanged since last run"]:::det
     SCAN["🩺 Trivy scan for CVEs"]:::det
     OWNEDQ{{"Is this an app you own,<br/>labeled & configured<br/>for rebuild-from-source?"}}:::det
-    REMED["🛠️ External remediation loop<br/>newer upstream tag, or OS-package<br/>patch → build → rescan → keep<br/>only if it provably reduced CVEs"]:::det
-    OPT["📦 tag-optimized-ext<br/>pushed to your registry<br/>(3rd-party copies are a team opt-in)"]:::out
 
     subgraph PHASEA["🔁 BASE-IMAGE agentic loop — ≤5 rounds, global budget of 20 attempts"]
-        LADDER["🛠️ Deterministic rungs:<br/>1. newer tag of the SAME base (≤5)<br/>2. OS-package patch in the<br/>Dockerfile's base stage (≤5)"]:::det
-        TESTA["✅ Validate EVERY candidate:<br/>rebuild → app's OWN test suite<br/>→ rescan; failures rolled back but<br/>RETAINED as evidence"]:::det
-        T2["🤖 Claude — base determination<br/>from the APPLICATION CODE<br/>(Dockerfile + manifests;<br/>already-tried bases excluded)"]:::llm
-        RESTR["🤖 Claude — Dockerfile restructure:<br/>zero-CVE base lacks build tooling?<br/>build in a stage WITH tooling,<br/>COPY artifacts into the minimal<br/>runtime + smoke-verify it"]:::llm
+        direction TB
+        LADDER["🛠️ Deterministic rungs:<br/>1. newer tag of the SAME base (≤5)<br/>2. OS-package patch in the base stage (≤5)"]:::det
+        TESTA["✅ Validate EVERY candidate:<br/>rebuild → app's OWN test suite → rescan;<br/>failures rolled back but RETAINED as evidence"]:::det
+        T2["🤖 Claude — base determination<br/>from the APPLICATION CODE<br/>(already-tried bases excluded)"]:::llm
+        RESTR["🤖 Claude — Dockerfile restructure:<br/>build WITH tooling, COPY artifacts into<br/>the minimal runtime + smoke-verify"]:::llm
         LADDER --> TESTA
-        TESTA -. "CVEs remain, budget left" .-> T2
-        T2 -. "adopted swap RE-ENTERS the rungs<br/>on the new base" .-> LADDER
-        TESTA -. "candidate failed ONLY for<br/>missing shell/pip" .-> RESTR
-        RESTR -. "builder/runtime split<br/>re-validated + smoke-gated" .-> TESTA
+        TESTA -. "CVEs remain" .-> T2
+        T2 -. "swap adopted —<br/>re-enter the rungs" .-> LADDER
+        T2 -. "zero-CVE base<br/>lacks shell/pip" .-> RESTR
+        RESTR -. "re-validated +<br/>smoke-gated" .-> TESTA
     end
 
-    BASEART["🧱 Winning base built standalone<br/>+ pushed: tag-golden-base (zero CVEs)<br/>or tag-optimized-base — a curated<br/>base OTHER apps can adopt"]:::out
+    BASEART["🧱 Winning base pushed standalone:<br/>vendor-qualified -golden-base / -optimized-base<br/>— a curated base OTHER apps can adopt"]:::out
 
     subgraph PHASEB["🔁 APPLICATION-IMAGE agentic loop — ≤5 passes"]
-        DEP["🛠️ Bump only APP-introduced CVEs<br/>(base's own already handled) to<br/>Trivy's exact fixed versions"]:::det
+        direction TB
+        DEP["🛠️ Bump only APP-introduced CVEs<br/>to Trivy's exact fixed versions"]:::det
         TESTB["✅ rebuild → test → rescan"]:::det
         DEP --> TESTB
-        TESTB -. "improved & app CVEs remain" .-> DEP
+        TESTB -. "improved & app<br/>CVEs remain" .-> DEP
     end
 
     OUTQ{{"zero TOTAL CVEs<br/>+ tests passing?"}}:::det
-    JUDGE["🤖 Claude — balanced adjudication<br/>across every retained candidate:<br/>vuln impact vs test breakage,<br/>concrete code-fix suggestions"]:::llm
-    GOLDEN["🏆 tag-golden-base-app (strict golden)<br/>or 📦 tag-optimized-app (balanced pick,<br/>flagged NON-DEPLOYABLE if tests fail)"]:::out
-    SUMMARY["🤖 Claude — per-image before/after<br/>report + run-level summary,<br/>committed to the reports repo<br/>next to the app's code"]:::llm
-    DEV["👩‍💻 Developers<br/>read reports & code-fix issues →<br/>fix breaking tests, adopt golden bases,<br/>restructure Dockerfiles (e.g. go-app)"]:::ppl
-    PROMO["🚀 GitOps PR (reviewed) or<br/>ArgoCD Image Updater carries it to<br/>staging/PPE/prod<br/>(never for non-deployable picks)"]:::out
+    JUDGE["🤖 Claude — balanced adjudication across<br/>every retained candidate: vuln impact vs<br/>test breakage; suggests code fixes and files<br/>them as an issue on the app's own repo"]:::llm
+    GOLDEN["🏆 tag-golden-base-app (strict golden) or<br/>📦 tag-optimized-app (balanced pick,<br/>flagged NON-DEPLOYABLE if tests fail)"]:::out
+    SUMMARY["🤖 Claude — per-image before/after report<br/>+ run-level summary, committed to the<br/>reports repo next to the app's code"]:::llm
+    REMED["🛠️ External remediation loop<br/>(3rd-party — not the intended scope):<br/>newer upstream tag or OS-package patch<br/>→ build → rescan → keep only if improved<br/>+ its own before/after report"]:::det
+    OPT["📦 tag-optimized-ext pushed<br/>to your registry<br/>(team opt-in)"]:::out
+    PROMO["🚀 GitOps PR (reviewed) or ArgoCD Image<br/>Updater carries it to staging/PPE/prod<br/>(never for non-deployable picks)"]:::out
+    DEV["👩‍💻 Developers read the reports & code-fix issues:<br/>fix breaking tests, adopt golden bases,<br/>restructure Dockerfiles"]:::ppl
 
     CRON --> DISC --> SCAN --> OWNEDQ
-    OWNEDQ -->|"no — 3rd-party image"| REMED --> OPT --> PROMO
     OWNEDQ -->|"yes — internal"| LADDER
     TESTA -->|"best base wins"| BASEART
     BASEART --> DEP
     TESTB --> OUTQ
-    OUTQ -->|yes| GOLDEN
-    OUTQ -. "no — weigh ALL attempts,<br/>passing and failing" .-> JUDGE --> GOLDEN
+    OUTQ -->|"yes"| GOLDEN
+    OUTQ -->|"no — weigh ALL attempts"| JUDGE --> GOLDEN
+    GOLDEN --> SUMMARY
     GOLDEN --> PROMO
-    REMED -.-> SUMMARY
-    GOLDEN -.-> SUMMARY
+    OWNEDQ -->|"no — 3rd-party"| REMED --> OPT --> PROMO
     SUMMARY ==> DEV
-    JUDGE -. "code-fix issue filed on the<br/>app's own source repo" .-> DEV
-    DEV ==>|"fixes committed → new image →<br/>next scheduled run re-validates"| DISC
+    DEV ==>|"fixes committed → next scheduled run re-validates"| DISC
 ```
 
 **The value this generates, continuously and without manual triage:**
@@ -89,6 +87,64 @@ flowchart TD
 3. **Adjudicating the balanced pick** — when no candidate reaches zero CVEs with passing tests, Claude weighs every retained attempt (including ones whose tests failed): is fixing a low-impact CVE worth breaking tests? Is eliminating a genuinely critical, reachable CVE worth a code change? It picks the best-balanced candidate with a written justification and concrete code-fix suggestions — but deployability is decided by the actual test result, never by the model, and a failing pick is pushed only as a flagged, non-deployable artifact.
 4. **The per-image before/after summary report** — turning a raw CVE diff into a prioritized, readable narrative (what changed, what's left, how to think about the residual risk) is a writing/judgment task, not a lookup.
 5. **The run-level summary** — one report per discovery run with an External section (third-party images: improvements, residual risk, mitigation options) and an Internal section (owned apps: base selections, posture improvement, app impact and code-change justifications).
+
+### Every activity at a glance — Deterministic vs LLM, and the value delivered
+
+The complete activity list in one panel: each numbered step tagged with who
+performs it (blue = deterministic code, yellow = one of the five LLM call
+sites), alongside everything the pipeline delivers. Note the ratio — 13 of 18
+activities are deterministic, and even the LLM steps only *propose*: adoption
+is always decided by builds, tests, and rescans.
+
+```mermaid
+flowchart LR
+    classDef det fill:#dbe9ff,stroke:#4a76c9,color:#0b2447,text-align:left
+    classDef llm fill:#fff3cd,stroke:#c9971e,stroke-width:2px,color:#3a2f00,text-align:left
+    classDef out fill:#d9f2e3,stroke:#2f9e5f,color:#0b3d24,text-align:left
+
+    subgraph ACT1["ACTIVITIES 1–9 — who does what"]
+        direction TB
+        A1["1. Discover every image running in the cluster — Deterministic"]:::det
+        A2["2. Track digests: skip unchanged images, gate publishing on real change — Deterministic"]:::det
+        A3["3. Trivy CVE scan (baseline + every rescan) — Deterministic"]:::det
+        A4["4. Classify ownership via labels & self-service annotations — Deterministic"]:::det
+        A5["5. Newer-tag bump of the same base (crane + Trivy-verified) — Deterministic"]:::det
+        A6["6. OS package patch injection (apk / apt / yum) — Deterministic"]:::det
+        A7["7. Gate EVERY change: rebuild → app's own tests → rescan → rollback — Deterministic"]:::det
+        A8["8. Base image determination from the application code — LLM 🤖"]:::llm
+        A9["9. Dockerfile restructure to builder/runtime + smoke check — LLM 🤖 (gates stay deterministic)"]:::llm
+        A1 ~~~ A2 ~~~ A3 ~~~ A4 ~~~ A5 ~~~ A6 ~~~ A7 ~~~ A8 ~~~ A9
+    end
+
+    subgraph ACT2["ACTIVITIES 10–18"]
+        direction TB
+        A10["10. Build, scan & publish the standalone base artifact — Deterministic"]:::det
+        A11["11. Bump app dependencies to Trivy's exact fixed versions — Deterministic"]:::det
+        A12["12. Balanced-pick adjudication + code-fix suggestions — LLM 🤖 (deployability from test results)"]:::llm
+        A13["13. Name & push final images; block non-deployable promotion — Deterministic"]:::det
+        A14["14. Open/update the GitOps promotion PR — Deterministic"]:::det
+        A15["15. File code-fix GitHub issues on the app's repo — Deterministic (content from 12)"]:::det
+        A16["16. Per-image before/after report — LLM 🤖"]:::llm
+        A17["17. Run-level summary, grounded in the run's evidence — LLM 🤖"]:::llm
+        A18["18. Commit reports to the reference repo + GitHub Release — Deterministic"]:::det
+        A10 ~~~ A11 ~~~ A12 ~~~ A13 ~~~ A14 ~~~ A15 ~~~ A16 ~~~ A17 ~~~ A18
+    end
+
+    subgraph VAL["VALUE DELIVERED"]
+        direction TB
+        V1["🏆 Golden (zero-CVE) application images,<br/>every change test-verified"]:::out
+        V2["🧱 Curated golden/optimized base catalog<br/>(vendor-qualified) other apps adopt directly"]:::out
+        V3["📦 Optimized third-party copies<br/>(opt-in, short-term stopgap)"]:::out
+        V4["🚀 Reviewable promotion PRs to<br/>higher environments — never auto-merged"]:::out
+        V5["🐛 Developer work lists: code-fix issues +<br/>adjudication reasoning for what machines can't fix"]:::out
+        V6["📚 Stakeholder reports repo — rendered, diffable,<br/>stable links; feeds Notion/Confluence/Jira"]:::out
+        V7["🗄️ Immutable audit trail — change-gated<br/>GitHub Releases, no duplicate noise"]:::out
+        V8["🔁 Continuous re-validation — every fix and<br/>every new CVE rechecked on schedule"]:::out
+        V1 ~~~ V2 ~~~ V3 ~~~ V4 ~~~ V5 ~~~ V6 ~~~ V7 ~~~ V8
+    end
+
+    ACT1 ~~~ ACT2 ~~~ VAL
+```
 
 ## How it works
 
@@ -274,7 +330,7 @@ per-iteration files. At most one final app image reaches the registry per run
 | `output/summary-report.md` | Claude Opus 4.8 before/after remediation summary covering the whole image's run |
 | `output/run-summary.md` | Discovery mode only: one Claude-composed run-level report — External + Internal sections across every image scanned this run |
 | GitHub Release | The files above attached as downloadable release assets — the immutable audit archive. Discovery mode creates one **only when a filtered image's digest changed** since the last run (scoped to that run's files), so a scheduled tick over an unchanged environment publishes nothing |
-| Reports repo (optional) | With `REPORTS_REPO` set, every report is *also* committed as rendered, diffable markdown: `reports/<repo>/<tag>/<date>-summary.md` + a stable `reports/<repo>/<tag>/latest.md` per image, and `reports/run-summary/` for discovery runs — the place for humans to read and study results |
+| Reports repo (optional) | With `REPORTS_REPO` set, every report is *also* committed as rendered, diffable markdown: `reports/<repo>/<tag>/<date>-summary.md` + a stable `reports/<repo>/<tag>/latest.md` per image, and `reports/run-summary/` for discovery runs. This is the **stakeholder-facing reference location** — share the repo (or specific `latest.md` links) with security, platform, and app teams, auditors, or anyone interested. Because reports land as plain markdown at stable paths, the same content is trivially forwarded into whatever your stakeholders already use — Notion, Confluence, Jira, Slack digests — by pointing their importers/automation at this repo; no agent changes needed |
 | Promotion PR body | The per-image summary is folded into the GitOps promotion PR (collapsed section), so reviewers see the security story where they approve the change |
 | Code-fix issue | A non-deployable balanced pick files the adjudication's `code_fixes` as a GitHub Issue on the app's own source repo (stable title — re-runs comment instead of duplicating) |
 | Final image | External: `<name>:<original-tag>-optimized-ext` (any real improvement, incl. a tag bump alone reaching zero — gated by `KEEP_EXTERNAL_IMAGES`). Internal: `-golden-base-app` (zero CVEs, tests passing) or `-optimized-app` (best balanced pick) — plus the winning base standalone as `-golden-base`/`-optimized-base` |
@@ -359,7 +415,7 @@ cp .env.example .env
 | `GITOPS_TOKEN` | No | PAT with access to `GITOPS_REPO`. Falls back to `GITHUB_TOKEN` if unset |
 | `GITOPS_BASE_BRANCH` | No | Branch to open promotion PRs against (default: `main`) |
 | `GITOPS_IMAGE_PATH_TEMPLATE` | No | Path within `GITOPS_REPO` to patch, e.g. `environments/ppe/{repo_name}/values.yaml` — `{repo_name}` is filled in per image |
-| `REPORTS_REPO` | No | `owner/repo` to commit summary reports into for browsing/diffing (dated file + stable `latest.md` per image). Empty disables — reports then live only on releases/PVC |
+| `REPORTS_REPO` | No | `owner/repo` to commit summary reports into — the shared reference repo external stakeholders read (and the source for forwarding into Notion/Confluence/Jira etc.). Dated file + stable `latest.md` per image. Empty disables — reports then live only on releases/PVC |
 | `REPORTS_BRANCH` | No | Branch in `REPORTS_REPO` to commit to (default `main`) |
 | `REPORTS_TOKEN` | No | PAT with access to `REPORTS_REPO`. Falls back to `GITHUB_TOKEN` if unset |
 | `CODE_FIX_ISSUES` | No | File the adjudication's code-fix suggestions as a GitHub Issue on the app's source repo when a balanced pick is non-deployable (default `true`) |
