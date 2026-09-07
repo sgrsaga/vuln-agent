@@ -117,6 +117,20 @@ def should_scan(entry: dict | None, digest: str | None, ttl_days: int = DEFAULT_
     return age_days > ttl_days
 
 
+def has_changed(entry: dict | None, digest: str | None) -> bool:
+    """
+    Digest-level change check, distinct from should_scan(): True only when the
+    image is genuinely different from what the last run assessed — never seen
+    before, unverifiable (must assume changed), or pointing at a new digest.
+    A TTL-forced rescan of an UNCHANGED digest returns False — that's the
+    signal run_discovery uses to skip publishing a duplicate GitHub Release
+    when a scheduled run found the exact same environment as last time.
+    """
+    if entry is None or digest is None:
+        return True
+    return entry.get("digest") != digest
+
+
 def record_result(state: dict, image_ref: str, digest: str | None, result: dict) -> None:
     state[image_ref] = {
         "digest": digest,

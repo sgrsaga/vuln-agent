@@ -204,6 +204,8 @@ def run_discovery(args) -> int:
         logger.info("FORCE_RESCAN set — ignoring tracked state, scanning everything")
 
     results: list[tuple[str, dict]] = []
+    changed_images: list[str] = []   # filtered images whose digest moved since last run
+    scanned_slugs: set[str] = set()  # output subdirs written THIS run (release asset scope)
 
     for idx, image in enumerate(images, 1):
         logger.info(f"\n{'='*60}")
@@ -211,6 +213,8 @@ def run_discovery(args) -> int:
 
         digest = tracker.resolve_digest(image)
         entry = state.get(image)
+        if tracker.has_changed(entry, digest):
+            changed_images.append(image)
         if not force_rescan and not tracker.should_scan(entry, digest, ttl_days):
             logger.info(
                 f"[{idx}/{len(images)}] Skipping {image} — unchanged since "
@@ -226,6 +230,7 @@ def run_discovery(args) -> int:
 
         # Each image gets its own output subdirectory
         image_output = base_output / _slugify(image)
+        scanned_slugs.add(_slugify(image))
         pub.set_output_dir(image_output)
 
         # Owned images with a usable config take the internal (rebuild-from-
@@ -253,8 +258,20 @@ def run_discovery(args) -> int:
 
     _print_summary(results)
 
-    # Run-level two-section report (external vs internal) — one Claude call.
-    if results:
+    # Publish only when this run actually saw something new: at least one
+    # filtered image's digest moved since the last run (or an explicit
+    # FORCE_RESCAN asked for a full re-run). A scheduled tick that found the
+    # exact same environment — including TTL-forced rescans of unchanged
+    # digests — produces NO new run-summary and NO new GitHub Release, instead
+    # of pushing an identical release over and over.
+    release_worthy = bool(changed_images) or force_rescan
+
+    if not release_worthy:
+        logger.info(
+            "No image digests changed since the last run — skipping the "
+            "run-level report and GitHub Release (nothing new to publish)"
+        )
+    if results and release_worthy:
         try:
             from agent.reporter import generate_run_report
             run_report = "# Run Summary — external & internal scopes\n\n" + generate_run_report(results)
@@ -270,13 +287,21 @@ def run_discovery(args) -> int:
         except Exception as exc:
             logger.warning(f"Run-level report generation failed: {exc}")
 
-    # One combined GitHub Release with all image artifacts
-    logger.info("Creating combined GitHub Release with all artifacts...")
-    pub.set_output_dir(base_output)  # reset so create_github_release logs correctly
-    try:
-        pub.create_github_release(base_dir=base_output)
-    except Exception as exc:
-        logger.warning(f"GitHub Release creation failed: {exc}")
+    # One combined GitHub Release, scoped to THIS run's artifacts only (stale
+    # per-image dirs persist on the output PVC across runs — never re-attach them).
+    if release_worthy:
+        logger.info(
+            f"Creating combined GitHub Release ({len(changed_images)} changed image(s): "
+            f"{', '.join(changed_images) or 'force rescan'})"
+        )
+        pub.set_output_dir(base_output)  # reset so create_github_release logs correctly
+        try:
+            pub.create_github_release(
+                base_dir=base_output,
+                include=scanned_slugs | {"run-summary.md"},
+            )
+        except Exception as exc:
+            logger.warning(f"GitHub Release creation failed: {exc}")
 
     any_clean = any(r.get("status") in ("clean", "golden_base_app") for _, r in results)
     return 0 if any_clean else 1

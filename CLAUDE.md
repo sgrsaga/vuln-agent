@@ -272,6 +272,18 @@ explicitly excludes `image_tracker.STATE_DIR_NAME` so the state file never ends 
 attached as a release asset. Scoped to discovery mode only — single-image mode
 (`main.py <image>`) always runs regardless of this state.
 
+The same digest state also gates PUBLISHING: `image_tracker.has_changed()`
+(new image, unverifiable digest, or digest moved — deliberately narrower than
+`should_scan()`, which also fires on TTL expiry and prior errors) is checked
+per filtered image, and the run-level report + combined GitHub Release are
+produced only when at least one image changed or `FORCE_RESCAN` is set — a
+scheduled tick that finds the identical environment publishes nothing instead
+of pushing a duplicate release, and a TTL-forced rescan of unchanged digests
+still updates the state/PVC but stays silent. Release assets are additionally
+scoped via `create_github_release(include=...)` to the subdirectories of
+images scanned THIS run plus `run-summary.md` — per-image dirs persist on the
+output PVC across runs and must never be re-attached wholesale.
+
 ### Output / publishing (`agent/publisher.py`)
 
 Exactly two files land in `OUTPUT_DIR` per image: `scan-baseline.json` (written once,

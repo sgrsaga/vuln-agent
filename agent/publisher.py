@@ -224,13 +224,22 @@ def publish_event(event_type: str, message: str, data: dict | None = None) -> No
     _md(f"\n> {message}\n")
 
 
-def create_github_release(base_dir: Path | None = None, tag: str | None = None) -> None:
+def create_github_release(
+    base_dir: Path | None = None,
+    tag: str | None = None,
+    include: set[str] | None = None,
+) -> None:
     """
-    Create a GitHub Release via REST API and upload all output files as assets.
+    Create a GitHub Release via REST API and upload output files as assets.
 
     In discovery mode pass base_dir as the parent of all per-image subdirs so
     that every image's artifacts are included. In single-image mode it defaults
     to get_output_dir().
+
+    `include`, when given, limits assets to files whose first path component
+    (relative to base_dir) is in the set — discovery mode passes the subdirs of
+    images actually scanned THIS run plus "run-summary.md", so a release never
+    re-attaches stale files persisted on the output PVC by earlier runs.
 
     Works anywhere (local, Docker, k8s) — no gh CLI required.
     No-op when GITHUB_ACTIONS is set (workflow uses actions/upload-artifact).
@@ -248,6 +257,7 @@ def create_github_release(base_dir: Path | None = None, tag: str | None = None) 
     files = [
         f for f in search_root.rglob("*")
         if f.is_file() and STATE_DIR_NAME not in f.parts
+        and (include is None or f.relative_to(search_root).parts[0] in include)
     ]
     if not files:
         logger.info("No output files found — skipping GitHub Release")

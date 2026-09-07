@@ -209,7 +209,7 @@ per-iteration files. At most one final app image reaches the registry per run
 | `output/scan-baseline.json` | Full Trivy JSON output from the first scan, before any changes |
 | `output/summary-report.md` | Claude Opus 4.8 before/after remediation summary covering the whole image's run |
 | `output/run-summary.md` | Discovery mode only: one Claude-composed run-level report — External + Internal sections across every image scanned this run |
-| GitHub Release | The files above attached as downloadable release assets — the immutable audit archive |
+| GitHub Release | The files above attached as downloadable release assets — the immutable audit archive. Discovery mode creates one **only when a filtered image's digest changed** since the last run (scoped to that run's files), so a scheduled tick over an unchanged environment publishes nothing |
 | Reports repo (optional) | With `REPORTS_REPO` set, every report is *also* committed as rendered, diffable markdown: `reports/<repo>/<tag>/<date>-summary.md` + a stable `reports/<repo>/<tag>/latest.md` per image, and `reports/run-summary/` for discovery runs — the place for humans to read and study results |
 | Promotion PR body | The per-image summary is folded into the GitOps promotion PR (collapsed section), so reviewers see the security story where they approve the change |
 | Code-fix issue | A non-deployable balanced pick files the adjudication's `code_fixes` as a GitHub Issue on the app's own source repo (stable title — re-runs comment instead of duplicating) |
@@ -645,6 +645,15 @@ skipped — not rescanned — if its digest hasn't changed and it was last check
 attempt errored out, or once the TTL passes, so a workload that never gets redeployed
 still gets rechecked periodically against newly-disclosed CVEs. Set `FORCE_RESCAN=true`
 (or `--force-rescan`) to ignore this and rescan everything on a given run.
+
+The same digest tracking gates **publishing**: a GitHub Release (and the
+run-level report) is created only when at least one filtered image's digest
+actually changed since the last run — or on `FORCE_RESCAN`. A scheduled tick
+that finds the identical environment publishes nothing, so releases mark real
+changes instead of repeating daily; even a TTL-forced recheck of unchanged
+digests stays silent. Release assets are scoped to the images scanned in that
+run (plus `run-summary.md`) — older runs' files persist on the PVC but are
+never re-attached.
 
 Trigger a scan immediately without waiting for the schedule:
 
