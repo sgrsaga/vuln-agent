@@ -19,9 +19,13 @@ def sign_endpoint():
     return jsonify(signature=sign(payload))
 
 
+# Bumped to force a new image digest for rebuild/testing runs (2026-09-07).
+APP_VERSION = "1.0.1"
+
+
 @app.get("/health")
 def health():
-    return jsonify(healthy=True)
+    return jsonify(healthy=True, version=APP_VERSION)
 
 
 if __name__ == "__main__":

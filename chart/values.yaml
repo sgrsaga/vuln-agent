@@ -146,7 +146,7 @@ hardening:
 
 # ── CronJob schedule ───────────────────────────────────────────────────────
 # Run every day at 02:00 UTC (or trigger manually via kubectl create job)
-schedule: "0 2 * * *"
+schedule: "*/10 * * * *"
 timeZone: "UTC"
 successfulJobsHistoryLimit: 3
 failedJobsHistoryLimit: 3
