@@ -1,0 +1,3 @@
+# Current, clean pins — this app's only CVE surface is its old base image, so
+# remediation reliably succeeds and the GitOps promotion PR fires.
+flask==3.0.3

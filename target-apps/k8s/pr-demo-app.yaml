@@ -1,0 +1,52 @@
+# pr-demo-app — sample owned workload for real vuln-agent testing.
+#
+# The pod LABEL vuln-agent.io/harden=true marks it as an owned image (must
+# match OWNED_IMAGE_LABEL_SELECTOR); the vuln-agent.io/* ANNOTATIONS are the
+# self-service hardening config read straight off the pod.
+#
+# PREREQUISITE: the agent clones source-repo and builds the directory holding
+# dockerfile-path, so all apps live together in the shared sgrsaga/reports repo
+# (next to the reports/ folder the agent writes) — see target-apps/k8s/README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pr-demo-app
+  namespace: apps
+  labels:
+    app: pr-demo-app
+    app.kubernetes.io/part-of: vuln-agent-target-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pr-demo-app
+  template:
+    metadata:
+      labels:
+        app: pr-demo-app
+        vuln-agent.io/harden: "true"
+      annotations:
+        vuln-agent.io/source-repo: "sgrsaga/reports"
+        vuln-agent.io/dockerfile-path: "pr-demo-app/Dockerfile"
+        vuln-agent.io/test-stage: "test"
+    spec:
+      imagePullSecrets:
+        - name: ghcr-credentials
+      containers:
+        - name: pr-demo-app
+          image: ghcr.io/sgrsaga/pr-demo-app:v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

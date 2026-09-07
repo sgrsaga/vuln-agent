@@ -96,3 +96,48 @@ hardening:
 | `java-app/` | `com.sun.net.httpserver` server (`/health`), Maven | `eclipse-temurin:17-jdk-alpine` | `mvn test` |
 | `nodejs-app/` | `node:http` server (`/health`) | `node:18-slim` | `node --test` (built-in test runner) |
 | `typescript-app/` | Same shape as `nodejs-app`, compiled via `tsc` | `node:18-slim` | `npm run build && node --test` on the compiled output |
+| `pr-demo-app/` | Flask API, clean current deps — its only CVE surface is the old pinned base, so remediation reliably succeeds | `python:3.11.4-slim` | `pytest` |
+| `risk-tradeoff-app/` | Flask + `ecdsa` signing API, engineered so **zero CVEs is unreachable** (see below) | `python:3.11.4-slim` | `pytest` |
+
+## Two purpose-built demo scenarios
+
+### `pr-demo-app` — successful remediation → GitOps promotion PR
+
+Everything about this app is clean except the deliberately old base, so the
+ladder fixes it, tests pass, and the result is **deployable** — which is the
+full trigger condition for the promotion PR-bot: `GITOPS_REPO` +
+`GITOPS_IMAGE_PATH_TEMPLATE` set, `final_image != image_ref`, and `deployable`.
+The file the bot patches lives in this tree at
+`gitops/environments/ppe/pr-demo-app/values.yaml` and is published into the
+shared repo as `environments/ppe/pr-demo-app/values.yaml` by
+`k8s/publish-apps.sh`. Expected result after a run: an open PR on the GitOps
+repo titled "Promote pr-demo-app to optimized image", on the stable
+`vuln-agent/optimize-pr-demo-app` branch, with the full before/after summary
+folded into the PR body — re-runs update the same PR instead of stacking new
+ones. Apps *without* a file at the templated path are skipped silently, so
+enabling the template is safe cluster-wide.
+
+### `risk-tradeoff-app` — forced adjudication: LLM code fixes + base-selection story
+
+Two deliberate fixtures make strict golden impossible, so Phase C's balanced
+adjudication always runs:
+
+1. **Unfixable dependency CVE** — `ecdsa==0.18.0` carries CVE-2024-23342
+   (HIGH, Minerva timing attack) which upstream has declared won't-fix: Trivy
+   reports no `FixedVersion`, so the dependency loop can never clear it. The
+   only real remediation is code-level (migrate to the `cryptography`
+   package's `ec` module) — exactly what the adjudication's `code_fixes`
+   should tell developers.
+2. **Debian-coupled test suite** — `tests/test_platform.py` asserts
+   `/etc/debian_version` exists. Zero-CVE minimal bases the LLM suggests
+   (alpine/distroless/chainguard) **fail the test suite**; Debian bases pass
+   but keep CVE surface. The base-selection story in the report shows every
+   candidate tried and why it was rejected, and the judgment must weigh
+   security-best-but-broken against passing-but-vulnerable.
+
+Expected result after a run: status `optimized_app` (never `golden_base_app`),
+a summary report containing the **Balanced-pick adjudication** section with
+justification + concrete code fixes (drop the `/etc/debian_version`
+assumption; replace `ecdsa` with `cryptography`), and — if the judgment picks
+a failing-tests candidate — a **NON-DEPLOYABLE** flag, no promotion PR, and a
+code-fix GitHub Issue filed on the source repo.

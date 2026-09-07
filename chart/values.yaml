@@ -49,7 +49,10 @@ gitops:
   existingSecret: "github-token"
   existingSecretKey: "gitops-token"
   baseBranch: "main"
-  imagePathTemplate: ""           # e.g. "environments/ppe/{repo_name}/values.yaml"
+  # Path the PR-bot patches inside gitops.repo. Only apps that actually have a
+  # file at this path get a PR (a 404 is silently skipped) — pr-demo-app's
+  # manifest is published there by target-apps/k8s/publish-apps.sh.
+  imagePathTemplate: "environments/ppe/{repo_name}/values.yaml"
 
 # ── Private registry for patched images ───────────────────────────────────
 registry:

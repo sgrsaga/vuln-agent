@@ -1,0 +1,7 @@
+flask==3.0.3
+# DELIBERATE FIXTURE: CVE-2024-23342 (Minerva timing attack, HIGH) affects all
+# ecdsa releases and upstream has stated it will not be fixed — Trivy reports
+# it with no FixedVersion, so vuln-agent's dependency loop can never clear it.
+# The only real remediation is code-level (migrate to the `cryptography`
+# package), which is exactly what the adjudication step should tell developers.
+ecdsa==0.18.0

@@ -27,7 +27,7 @@ OWNER="${1:-sgrsaga}"
 TAG="${2:-v1}"
 REPO="${3:-reports}"
 APPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APPS="python-app go-app java-app nodejs-app typescript-app"
+APPS="python-app go-app java-app nodejs-app typescript-app pr-demo-app risk-tradeoff-app"
 : "${GITHUB_TOKEN:?set GITHUB_TOKEN (classic scopes: repo + write:packages)}"
 
 api() {
@@ -70,6 +70,12 @@ for app in ${APPS}; do
   rm -rf "${tmp}/repo/${app}"
   cp -r "${APPS_DIR}/${app}" "${tmp}/repo/${app}"
 done
+# GitOps environment manifests (the files the promotion PR-bot patches) live in
+# the same shared repo under environments/ — synced like the app folders.
+if [ -d "${APPS_DIR}/gitops/environments" ]; then
+  rm -rf "${tmp}/repo/environments"
+  cp -r "${APPS_DIR}/gitops/environments" "${tmp}/repo/environments"
+fi
 if [ -n "$(git -C "${tmp}/repo" status --porcelain)" ]; then
   git -C "${tmp}/repo" -c user.email=vuln-agent@local -c user.name=vuln-agent add -A
   git -C "${tmp}/repo" -c user.email=vuln-agent@local -c user.name=vuln-agent \
