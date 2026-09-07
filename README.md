@@ -2,6 +2,11 @@
 
 An agentic pipeline that automatically scans every Docker image running in a cluster and remediates by ownership: third-party images get deterministic tag bumps and OS-package patches (kept only when a rescan proves improvement), while owned applications are rebuilt from source through bounded agentic loops — Claude-suggested base images and dependency upgrades, every candidate gated by the app's own test suite — producing golden (zero-CVE) base and app images, with Claude adjudicating the best balanced pick when zero isn't reachable and writing the before/after reports.
 
+Free and open source under the [MIT license](LICENSE) — use it, fork it,
+adapt it to your organization. Read
+[Adopting this project — pros, cons & risks](#adopting-this-project--pros-cons--risks)
+before running it against a real cluster.
+
 ## Overview — what this does once it's running in your cluster
 
 Deployed as a scheduled Kubernetes CronJob (see `chart/`), with zero manual
@@ -918,6 +923,94 @@ The Job manifests mount `/var/run/docker.sock` from the host node, which gives r
 
 ---
 
+## Adopting this project — pros, cons & risks
+
+An honest assessment for anyone considering running this against a real
+cluster. The short version: the *verification* is deterministic (Trivy rescans
+and your own test suites gate every change), but the agent builds, pushes, and
+files PRs/issues on your behalf — adopt it with eyes open.
+
+### Pros
+
+- **Continuous, not point-in-time** — every running image is rechecked on a
+  schedule, so CVEs disclosed *after* an image was built still get caught,
+  including on workloads nobody has redeployed in months.
+- **Nothing ships on a guess** — every candidate must prove itself: a Trivy
+  rescan showing a severity-ordered improvement, and (for owned apps) the
+  app's own test suite passing. Failing attempts are rolled back, retained
+  only as evidence.
+- **Bounded, targeted LLM use** — exactly four call sites, each a genuinely
+  ambiguous decision; everything else is lookup-table/deterministic code, so
+  API cost is small and behavior is auditable. Deployability is decided by
+  test results, never by the model.
+- **Golden bases compound** — the standalone `-golden-base`/`-optimized-base`
+  artifacts become a curated base catalog other teams adopt directly.
+- **Humans stay in the loop where it matters** — higher-environment promotion
+  is a reviewable PR (never auto-merged), non-deployable picks are flagged and
+  never promoted, and code-fix suggestions land as issues in the team's normal
+  triage flow.
+- **Change-gated noise control** — an unchanged environment produces no new
+  release, no new report, no duplicate PRs (stable branch/issue titles).
+
+### Cons
+
+- **Needs a Docker daemon to actually fix anything** — either the privileged
+  dind sidecar (chart) or a host socket (legacy manifests). Without one it's
+  analysis-only. Builds are also the slow path: a first full run over many
+  owned apps takes real time and disk.
+- **HIGH/CRITICAL only, Trivy's view only** — MEDIUM/LOW are out of scope by
+  default, and coverage is bounded by Trivy's DB (e.g. distro backports can
+  produce false positives, unfixed CVEs linger by design).
+- **Tag-bump finder is strict-semver** — suffixed or exotic tag schemes
+  (e.g. `3.9-slim`) don't parse, so rung 1 silently no-ops for them.
+- **Onboarding discipline required** — hardening only works when the
+  `test`/`testStage` shares lineage with the runtime stage and the test suite
+  is genuinely meaningful; a weak test suite converts "test-verified" into
+  false confidence.
+- **Sequential discovery** — images are processed one at a time; very large
+  clusters need namespace scoping or a wider schedule window.
+
+### Risks — know these before deploying
+
+- **Privileged container / root-equivalent surface**: the dind sidecar runs
+  `privileged: true` (and the legacy path mounts the host Docker socket, which
+  is root on the node). Confine the agent to dedicated nodes, restrict via
+  Pod Security/OPA, or swap in rootless builds (Kaniko) if your threat model
+  demands it. See [Security considerations](#security-considerations-for-production).
+- **It executes code from cloned repos**: hardening builds and runs the target
+  app's own Dockerfile and tests. `testCommand` runs with `--network none`,
+  but this is **not full sandboxing** — the build shares the docker daemon
+  and kernel. Treat `source-repo` annotations/config as trusted input only;
+  a hostile repo (or hostile annotation on a labeled pod) is code execution
+  in the agent's environment.
+- **Broad credentials in one pod**: a GitHub PAT with `repo` +
+  `write:packages` and an Anthropic key live in the agent's namespace.
+  Scope tokens to the minimum repos, rotate them, and prefer fine-grained
+  PATs where the flows allow.
+- **Rebuilt images are *your* artifacts now**: an `-optimized-ext` copy of a
+  third-party image (and `-golden-base` forks of upstream bases) shifts
+  patch-tracking, provenance, and license responsibility to you, and drifts
+  from vendor-supported binaries — some vendors won't support modified
+  images. That's why `KEEP_EXTERNAL_IMAGES` is a deliberate team decision.
+- **Blanket OS upgrades change behavior**: `apk upgrade`/`apt-get upgrade`
+  layers can alter library versions beyond the CVE fix. External images get
+  only a rescan (no tests), so a behavioral regression in a third-party image
+  would not be caught by this pipeline — canary such images downstream.
+- **Non-deployable artifacts exist in the registry**: a failing balanced pick
+  is pushed as evidence, flagged in the report, and never gets a PR — but
+  nothing physically stops someone `docker pull`ing it. Keep the ArgoCD
+  `allow-tags` regex tight (`optimized-ext|golden-base-app` only).
+- **LLM output is bounded but not infallible**: base suggestions and
+  adjudication justifications come from a model. The test+rescan gate catches
+  bad bases, and deployability never comes from the model — but read the
+  adjudication reasoning before acting on its code-fix suggestions, same as
+  any code review.
+- **Prompt-injection surface**: scan results and repo files are folded into
+  LLM prompts. A malicious package name or Dockerfile comment could try to
+  steer suggestions; the deterministic gates (build/test/rescan, regex-based
+  file patching, test-result-driven deployability) are the mitigation — keep
+  them in the loop if you extend the LLM's role.
+
 ## Project structure
 
 ```
@@ -941,7 +1034,14 @@ vuln-agent/
 │       └── vuln-remediate.yml  # GitHub Actions workflow (manual trigger)
 ├── Dockerfile            # Agent container image
 ├── .dockerignore
+├── LICENSE               # MIT
 ├── main.py               # CLI entry point
 ├── requirements.txt
 └── .env.example
 ```
+
+## License
+
+[MIT](LICENSE) — free for commercial and private use, modification, and
+redistribution. No warranty: you run the remediation pipeline, the images it
+produces, and the PRs it opens at your own risk (see the risks section above).
