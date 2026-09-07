@@ -15,7 +15,7 @@ one, and only ever reaches for Claude at the five specific points where a
 lookup table genuinely can't do the job — everything else (tag bumps, package
 upgrades, build/test/rescan verification) is deterministic and Trivy-verified.
 
-<img src="vuln-agent.jpg" alt="vuln-agent — cluster-wide scan, remediate, verify, and report pipeline" width="80%">
+<img src="vuln-agent.jpg" alt="vuln-agent — cluster-wide scan, remediate, verify, and report pipeline" width="100%">
 
 
 ## Agentic flow
