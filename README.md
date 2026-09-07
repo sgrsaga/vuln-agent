@@ -407,8 +407,8 @@ Two deployment paths, pick one:
 #### A1 — Build and push the agent image
 
 ```bash
-docker build -t ghcr.io/your-org/vuln-agent:latest .
-docker push ghcr.io/your-org/vuln-agent:latest
+docker build -t ghcr.io/your-org/vuln-agent:<yyyymmdd> .
+docker push ghcr.io/your-org/vuln-agent:<yyyymmdd>
 ```
 
 Set the reference in `chart/values.yaml` under `image:` — pin by `digest` (as
