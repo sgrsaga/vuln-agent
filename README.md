@@ -83,53 +83,10 @@ flowchart TD
 
 ## How it works
 
-Two very different paths, chosen by ownership — a third-party image is only
-ever patched at the image layer (no test authority means no rebuild), while an
-owned app is rebuilt from source through bounded agentic loops, every candidate
-gated by its own test suite.
-
-### External scope — zooming into the external remediation loop above (3rd-party images)
-
-```
-Input image
-     │
-     ▼
-┌────────────────────────────────────────────────────────────────────┐
-│                 Remediation Loop (per iteration)                   │
-│                                                                    │
-│   Trivy scan                                                       │
-│       │                                                            │
-│       ▼                                                            │
-│   Newer upstream tag already fixes it?                             │
-│       │                                                            │
-│       ├── yes ──► adopt it (no build needed)                       │
-│       │                                                            │
-│       └── no ───► OS-package patch (apk/apt/yum — no LLM)          │
-│                       │                                            │
-│                       ▼                                            │
-│                   docker build ──► rescan                          │
-│                       │                                            │
-│                       ▼                                            │
-│                   improved?                                        │
-│                    │      │                                        │
-│                   yes     no ──► discard build, stop               │
-│                    │                                               │
-│                    └──────► loop back to Trivy scan                │
-└────────────────────────────────────────────────────────────────────┘
-                                 │ clean, or no further patches possible
-                                 ▼
-        push <tag>-optimized-ext ─► ONE Claude Opus before/after
-        to private registry       summary report ──► GitHub Release
-```
-
-**Loop termination — first condition wins:**
-
-| Condition | Status |
-|-----------|--------|
-| Zero HIGH/CRITICAL CVEs remain | `clean` |
-| All remaining CVEs require source rebuild (Go binaries, no upstream fix) | `no_further_patches` |
-| Patch applied but CVE count did not decrease | `no_improvement` |
-| `MAX_ITERATIONS` reached (default: 5) | `max_iterations` |
+Two very different paths, chosen by ownership — an owned app is rebuilt from
+source through bounded agentic loops, every candidate gated by its own test
+suite, while a third-party image is only ever patched at the image layer (no
+test authority means no rebuild).
 
 ### Internal scope — the two agentic loop boxes above (owned apps)
 
@@ -197,6 +154,49 @@ Internal runs end in `golden_base_app` (zero total CVEs, tests passing),
 `optimized_app` (best balanced pick), or `no_improvement` (nothing pushed).
 Configuration, onboarding, and the test-stage-lineage requirement are covered in
 [Base image hardening](#base-image-hardening--golden-images-for-owned-applications).
+
+### External scope — zooming into the external remediation loop above (3rd-party images)
+
+```
+Input image
+     │
+     ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                 Remediation Loop (per iteration)                   │
+│                                                                    │
+│   Trivy scan                                                       │
+│       │                                                            │
+│       ▼                                                            │
+│   Newer upstream tag already fixes it?                             │
+│       │                                                            │
+│       ├── yes ──► adopt it (no build needed)                       │
+│       │                                                            │
+│       └── no ───► OS-package patch (apk/apt/yum — no LLM)          │
+│                       │                                            │
+│                       ▼                                            │
+│                   docker build ──► rescan                          │
+│                       │                                            │
+│                       ▼                                            │
+│                   improved?                                        │
+│                    │      │                                        │
+│                   yes     no ──► discard build, stop               │
+│                    │                                               │
+│                    └──────► loop back to Trivy scan                │
+└────────────────────────────────────────────────────────────────────┘
+                                 │ clean, or no further patches possible
+                                 ▼
+        push <tag>-optimized-ext ─► ONE Claude Opus before/after
+        to private registry       summary report ──► GitHub Release
+```
+
+**Loop termination — first condition wins:**
+
+| Condition | Status |
+|-----------|--------|
+| Zero HIGH/CRITICAL CVEs remain | `clean` |
+| All remaining CVEs require source rebuild (Go binaries, no upstream fix) | `no_further_patches` |
+| Patch applied but CVE count did not decrease | `no_improvement` |
+| `MAX_ITERATIONS` reached (default: 5) | `max_iterations` |
 
 **Output artifacts per run:**
 
