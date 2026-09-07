@@ -26,7 +26,10 @@ the clone as the build context, and the dependency manifests the dep loop
 edits (`requirements.txt`, `package.json`, `go.mod`, `pom.xml`) are looked up
 there too. `publish-apps.sh` syncs only the app folders (never touching
 `reports/`, never force-pushing), logs docker into ghcr.io itself, and
-builds/pushes each app's image from its subdirectory in one step.
+builds/pushes each app's image from its subdirectory in one step. The GitOps
+environment manifests the promotion PR-bot patches live in the vuln-agent repo
+itself (`environments/` at its root, `GITOPS_REPO=sgrsaga/vuln-agent`) — not
+in this shared repo.
 
 ## Setup
 

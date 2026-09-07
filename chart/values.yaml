@@ -44,7 +44,7 @@ reports:
 # optimized image reference. Leave repo empty to disable — lower environments
 # should use ArgoCD Image Updater instead (see README, no config here).
 gitops:
-  repo: "sgrsaga/reports"         # owner/repo of the GitOps manifests repo
+  repo: "sgrsaga/vuln-agent"      # owner/repo of the GitOps manifests repo
   token: ""                       # falls back to github.token if unset
   existingSecret: "github-token"
   existingSecretKey: "gitops-token"

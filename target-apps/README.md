@@ -107,10 +107,9 @@ Everything about this app is clean except the deliberately old base, so the
 ladder fixes it, tests pass, and the result is **deployable** — which is the
 full trigger condition for the promotion PR-bot: `GITOPS_REPO` +
 `GITOPS_IMAGE_PATH_TEMPLATE` set, `final_image != image_ref`, and `deployable`.
-The file the bot patches lives in this tree at
-`gitops/environments/ppe/pr-demo-app/values.yaml` and is published into the
-shared repo as `environments/ppe/pr-demo-app/values.yaml` by
-`k8s/publish-apps.sh`. Expected result after a run: an open PR on the GitOps
+The file the bot patches lives in the vuln-agent repo itself at
+`environments/ppe/pr-demo-app/values.yaml` (GITOPS_REPO=sgrsaga/vuln-agent) —
+committed like any other repo file, no publish step involved. Expected result after a run: an open PR on the GitOps
 repo titled "Promote pr-demo-app to optimized image", on the stable
 `vuln-agent/optimize-pr-demo-app` branch, with the full before/after summary
 folded into the PR body — re-runs update the same PR instead of stacking new
