@@ -2,7 +2,7 @@
 
 An agentic pipeline that automatically scans every Docker image running in a cluster and remediates by ownership: **owned applications** are rebuilt from source through bounded agentic loops — Claude-suggested base images and dependency upgrades, every candidate gated by the app's own test suite — producing golden (zero-CVE) base and app images, with Claude adjudicating the best balanced pick when zero isn't reachable and writing the before/after reports. Third-party images (not recommended and not the intended scope, but worth considering for short-term requirements) get deterministic tag bumps and OS-package patches, kept only when a rescan proves improvement.
 
-Free and open source under the [MIT license](LICENSE) — use it, fork it,
+Free and open source under the [MIT](https://choosealicense.com/licenses/mit/) — use it, fork it,
 adapt it to your organization. Read
 [Adopting this project — pros, cons & risks](#adopting-this-project--pros-cons--risks)
 before running it against a real cluster.
@@ -15,7 +15,7 @@ one, and only ever reaches for Claude at the five specific points where a
 lookup table genuinely can't do the job — everything else (tag bumps, package
 upgrades, build/test/rescan verification) is deterministic and Trivy-verified.
 
-<img src="vuln-agent.jpg" alt="vuln-agent — cluster-wide scan, remediate, verify, and report pipeline" width="100%">
+<img src="vuln-agent.gif" alt="vuln-agent — cluster-wide scan, remediate, verify, and report pipeline" width="50%">
 
 
 ## Agentic flow
