@@ -7,6 +7,27 @@ adapt it to your organization. Read
 [Adopting this project — pros, cons & risks](#adopting-this-project--pros-cons--risks)
 before running it against a real cluster.
 
+## Who is this for?
+
+**Best fit — fast-paced development.** This project earns its keep where
+container images change *constantly*: rapid application development with
+frequently shifting scope, teams spinning up many prototypes and short-lived
+services, platform teams onboarding new apps every sprint. In that environment
+nobody has time to chase CVEs per image — the agent absorbs the external
+security overhead automatically (scan, rebase, patch, test-verify, report),
+developers keep shipping, and every newly built image gets pulled toward a
+golden base without a security review blocking the loop.
+
+**Weak fit — stable/legacy estates.** Organizations maintaining the same
+application code for years with minor changes gain much less: their images
+rarely change (so the digest-gated runs are mostly silent), their base images
+are already institutionalized, and established patch-management processes
+usually cover the same ground with more ceremony. The one thing such estates
+still get from a scheduled run is early warning — periodic rescans catch
+*newly disclosed* CVEs against images nobody has touched in months, plus the
+report/issue trail to act on them — but the agentic rebuild machinery that is
+the heart of this project will sit mostly idle.
+
 ## Overview — what this does once it's running in your cluster
 
 Deployed as a scheduled Kubernetes CronJob (see `chart/`), with zero manual
